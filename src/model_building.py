@@ -103,7 +103,6 @@ class BERTClassificationStrategy(ModelBuildingStrategy):
         epochs: int = 5,
         freeze_last_k_layers: int = 6,
         device: torch.device = None,
-        test_split_ratio: float = 0.1,
     ):
         self.model_name = model_name
         self.epochs = epochs
@@ -111,7 +110,6 @@ class BERTClassificationStrategy(ModelBuildingStrategy):
         self.configurator = ModelConfigurator(
             special_tokens, freeze_last_k_layers, device
         )
-        self.test_ratio = test_split_ratio
 
     def build_and_train_model(self, dataset: Dataset) -> Dict[str, Any]:
         # Load tokenizer and model
