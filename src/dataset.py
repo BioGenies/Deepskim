@@ -58,8 +58,8 @@ EXCLUDE_REASONS = ["Review article"]
 
 def main():
     # File names (manually defined)
-    raw_file = RAW_DIR / "amyloid-raw-19-06-2025.csv"
-    processed_file = PROCESSED_DIR / "amyloid-19-06-2025.csv"
+    raw_file = RAW_DIR / "amyloid-raw-02-07-2025.csv"
+    processed_file = PROCESSED_DIR / "amyloid-02-07-2025.csv"
 
     # Check if processed file already exists
     if processed_file.exists():
