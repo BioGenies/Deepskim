@@ -1,6 +1,6 @@
 import logging
 from abc import ABC, abstractmethod
-from typing import Tuple, List
+from typing import Tuple, List, Iterable
 import pandas as pd
 from datasets import Dataset, DatasetDict
 import re
@@ -14,6 +14,33 @@ def mark_keywords(text: str, keywords: list[str], marker: str = "[KEY]") -> str:
         # \b – word boundaries, re.IGNORECASE – case-insensitive
         pattern = rf"\b{re.escape(kw)}\b"
         text = re.sub(pattern, f"{marker} {kw} {marker}", text, flags=re.IGNORECASE)
+    return text
+
+
+def mark_keywords2(text: str, keywords: Iterable[str], marker: str = "[KEY]") -> str:
+    """
+    Marks every occurrence of a word from keywords with a marker (e.g., [KEY] word [KEY]).
+    Works with punctuation and avoids substituting fragments of other words.
+
+    Args:
+        text: The input string to search within.
+        keywords: An iterable of strings representing the keywords to mark.
+        marker: The string to use as a marker around keywords (default is "[KEY]").
+
+    Returns:
+        A string with the keywords marked by the specified marker.
+    """
+
+    def repl(match):
+        w = match.group(0)
+        return f"{marker} {w} {marker}"
+
+    keywords_sorted = sorted(set(keywords), key=len, reverse=True)
+    for kw in keywords_sorted:
+        if not kw:
+            continue
+        pattern = r"\b" + re.escape(kw) + r"\b"
+        text = re.sub(pattern, repl, text, flags=re.IGNORECASE)
     return text
 
 
@@ -48,25 +75,25 @@ def mark_keywords(text: str, keywords: list[str], marker: str = "[KEY]") -> str:
 #     )
 
 
-def preprocess_batch_abstract(examples, tokenizer, keywords):
+def preprocess_batch_abstract(examples, tokenizer, keywords, max_length):
     marked = [mark_keywords(a, keywords) for a in examples["Abstract"]]
     tok = tokenizer(
         marked,
         truncation=True,
         padding="max_length",
-        max_length=350,
+        max_length=max_length,
     )
     tok["Abstract2"] = marked
     return tok
 
 
-def preprocess_batch_titles(examples, tokenizer, keywords: list[str]):
+def preprocess_batch_titles(examples, tokenizer, keywords: list[str], max_length):
     marked = [mark_keywords(t, keywords) for t in examples["Title"]]
     tok = tokenizer(
         marked,
         truncation=True,
         padding="max_length",
-        max_length=32,
+        max_length=max_length,
     )
     tok["Title2"] = marked
     return tok
@@ -79,6 +106,7 @@ class DatasetConverter(ABC):
         splits,
         tokenizer: PreTrainedTokenizer,
         keywords: List[str],
+        max_length: int = 350,
     ):
         """
         Convert raw splits into HuggingFace Datasets for Trainer.
@@ -92,6 +120,7 @@ class TrainTestConverter(DatasetConverter):
         splits: Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series],
         tokenizer: PreTrainedTokenizer,
         keywords: List[str],
+        max_length: int = 350,
     ) -> DatasetDict:
         """
         Convert a train-test split into an HF DatasetDict with 'train' and 'test' splits.
@@ -114,7 +143,9 @@ class TrainTestConverter(DatasetConverter):
         )
 
         dataset = dataset.map(
-            lambda batch: preprocess_batch_abstract(batch, tokenizer, keywords),
+            lambda batch: preprocess_batch_abstract(
+                batch, tokenizer, keywords, max_length
+            ),
             batched=True,
         )
 
@@ -137,6 +168,7 @@ class FoldsConverter(DatasetConverter):
         folds: List[Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]],
         tokenizer: PreTrainedTokenizer,
         keywords: List[str],
+        max_length: int = 350,
     ) -> List[DatasetDict]:
         """
         For each fold (X_train, X_test, y_train, y_test)
@@ -145,9 +177,7 @@ class FoldsConverter(DatasetConverter):
         """
         all_datasets = []
         for idx, split in enumerate(folds):
-            ds = self.base.convert(split, tokenizer, keywords)
+            ds = self.base.convert(split, tokenizer, keywords, max_length)
             logging.info(f"Fold {idx}: conversion finished.")
             all_datasets.append(ds)
         return all_datasets
-
-

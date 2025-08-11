@@ -1,7 +1,9 @@
+import os
+import random
 import logging
 from abc import ABC, abstractmethod
 from typing import Any, Dict
-
+import tempfile
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -12,51 +14,98 @@ from transformers import (
     AutoModelForSequenceClassification,
     TrainingArguments,
     Trainer,
+    set_seed,
 )
 from datasets import Dataset
 
-# Setup logging configuration
+print("model2 :)")
+
+
+# ---------- Reproducibility helper ----------
+def set_global_seed(seed: int):
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # transformers helper
+    set_seed(seed)
+    # Torch deterministic flags (may impact performance / availability)
+    try:
+        torch.use_deterministic_algorithms(True)
+    except Exception:
+        # fallback for older torch versions
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+# ---------- Logging ----------
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
 
-# Utility class for model configuration
+# ---------- Model configurator with safer attribute access ----------
 class ModelConfigurator:
-    def __init__(
-        self,
-        special_tokens: list[str],
-        freeze_last_k_layers: int = 6,
-        device: torch.device = None,
-    ):
+    def __init__(self, special_tokens: list[str], unfreeze_last_k_layers: int = 6):
         self.special_tokens = special_tokens
-        self.freeze_last_k = freeze_last_k_layers
-        self.device = device
+        self.unfreeze_last_k = unfreeze_last_k_layers
 
     def add_special_tokens(self, tokenizer, model):
         logging.info("Adding special tokens and resizing model embeddings.")
         tokenizer.add_special_tokens({"additional_special_tokens": self.special_tokens})
         model.resize_token_embeddings(len(tokenizer))
 
+    def _get_base_model(self, model):
+        # handle variations like model.bert, model.roberta, model.base_model, etc.
+        if hasattr(model, "base_model"):
+            return model.base_model
+        for attr in ["bert", "roberta", "distilbert", "electra"]:
+            if hasattr(model, attr):
+                return getattr(model, attr)
+        return None
+
     def freeze_layers(self, model):
         logging.info(
-            "Freezing model layers, except pooler, classifier, last K encoder layers, and embeddings."
+            "Freezing most model parameters, unfreezing classifier, embeddings and last K encoder layers (if present)."
         )
+        # freeze all first
         for param in model.parameters():
             param.requires_grad = False
-        for param in model.classifier.parameters():
-            param.requires_grad = True
-        for param in model.base_model.pooler.parameters():
-            param.requires_grad = True
-        encoder_layers = list(model.base_model.encoder.layer)
-        for layer in encoder_layers[-self.freeze_last_k :]:
-            for param in layer.parameters():
+
+        # unfreeze classifier head if exists
+        if hasattr(model, "classifier"):
+            for param in model.classifier.parameters():
                 param.requires_grad = True
-        for param in model.base_model.embeddings.parameters():
-            param.requires_grad = True
+
+        base = self._get_base_model(model)
+        # unfreeze pooler if present
+        if base is not None and hasattr(base, "pooler"):
+            try:
+                for param in base.pooler.parameters():
+                    param.requires_grad = True
+            except Exception:
+                pass
+
+        # try to unfreeze embeddings
+        if base is not None and hasattr(base, "embeddings"):
+            for param in base.embeddings.parameters():
+                param.requires_grad = True
+
+        # unfreeze last K encoder layers (if encoder exists)
+        if (
+            base is not None
+            and hasattr(base, "encoder")
+            and hasattr(base.encoder, "layer")
+        ):
+            encoder_layers = list(base.encoder.layer)
+            for layer in encoder_layers[-self.unfreeze_last_k :]:
+                for param in layer.parameters():
+                    param.requires_grad = True
 
 
-# Custom Trainer to incorporate class weights
+# ---------- Custom Trainer ----------
 class CustomTrainer(Trainer):
     def __init__(self, class_weights, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -72,18 +121,19 @@ class CustomTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
 
+# ---------- Metrics (safe for binary; change average for multiclass) ----------
 def compute_metrics(pred):
     labels = pred.label_ids
     preds = pred.predictions.argmax(-1)
     return {
-        "accuracy": (preds == labels).mean(),
-        "precision": precision_score(labels, preds),
-        "recall": recall_score(labels, preds),
-        "f1": f1_score(labels, preds),
+        "accuracy": float((preds == labels).mean()),
+        "precision": precision_score(labels, preds, average="binary", zero_division=0),
+        "recall": recall_score(labels, preds, average="binary", zero_division=0),
+        "f1": f1_score(labels, preds, average="binary", zero_division=0),
     }
 
 
-# Abstract Base Class for single-dataset training
+# ---------- Strategy / Builder ----------
 class ModelBuildingStrategy(ABC):
     @abstractmethod
     def build_and_train_model(self, dataset: Dataset) -> Dict[str, Any]:
@@ -99,23 +149,33 @@ class BERTClassificationStrategy(ModelBuildingStrategy):
     def __init__(
         self,
         model_name: str,
+        num_labels: int,
+        hparams: Dict[str, Any],
         special_tokens: list[str],
-        epochs: int = 5,
-        freeze_last_k_layers: int = 6,
+        unfreeze_last_k_layers: int,
         device: torch.device = None,
     ):
         self.model_name = model_name
-        self.epochs = epochs
+        self.num_labels = num_labels
+        self.hparams = hparams
         self.device = device
-        self.configurator = ModelConfigurator(
-            special_tokens, freeze_last_k_layers, device
-        )
+        self.configurator = ModelConfigurator(special_tokens, unfreeze_last_k_layers)
+        """
+        hparams: 
+            {
+                "learning_rate": 1e-5,
+                "per_device_train_batch_size": 16,
+                "num_train_epochs": 3,
+                "weight_decay": 0.05,
+                "warmup_ratio": 0.1
+            }
+        """
 
     def build_and_train_model(self, dataset: Dataset) -> Dict[str, Any]:
         # Load tokenizer and model
         tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         model = AutoModelForSequenceClassification.from_pretrained(
-            self.model_name, num_labels=2
+            self.model_name, num_labels=self.num_labels
         )
         model.to(self.device)
 
@@ -126,21 +186,27 @@ class BERTClassificationStrategy(ModelBuildingStrategy):
         dataset.set_format(
             type="torch", columns=["input_ids", "attention_mask", "labels"]
         )
-
+        temp_dir = "./bert"
+        # with tempfile.TemporaryDirectory() as temp_dir:
         # Setup training arguments
         training_args = TrainingArguments(
-            output_dir="./bert_finetuned",
+            output_dir=temp_dir,
             eval_strategy="epoch",
             save_strategy="epoch",
-            per_device_train_batch_size=16,
+            per_device_train_batch_size=self.hparams["per_device_train_batch_size"],
             per_device_eval_batch_size=16,
-            num_train_epochs=self.epochs,
-            learning_rate=1e-5,
-            weight_decay=0.05,
-            logging_steps=100,
+            num_train_epochs=self.hparams["num_train_epochs"],
+            learning_rate=self.hparams["learning_rate"],
+            weight_decay=self.hparams["weight_decay"],
+            warmup_ratio=self.hparams["warmup_ratio"],
+            logging_steps=10,
             load_best_model_at_end=True,
+            save_total_limit=1,
             metric_for_best_model="f1",
-            fp16=False,
+            greater_is_better=True,
+            fp16=self.device.type == "cuda",
+            report_to=["wandb"],
+            seed=42,
         )
 
         # Compute class weights for CV train split
@@ -177,28 +243,3 @@ class ModelBuilder:
     def build_model(self, dataset: Dataset) -> Dict[str, Any]:
         logging.info("Building and training the model on single dataset.")
         return self._strategy.build_and_train_model(dataset)
-
-
-# # Example usage:
-# if __name__ == "__main__":
-#     # Detect device
-#     device = torch.device(
-#         "mps"
-#         if torch.backends.mps.is_available()
-#         else "cuda"
-#         if torch.cuda.is_available()
-#         else "cpu"
-#     )
-#     logging.info(f"Using device: {device}")
-
-#     strategy = BERTClassificationStrategy(
-#         model_name="bert-base-uncased",
-#         special_tokens=["[KEY]"],
-#         epochs=3,
-#         freeze_last_k_layers=4,
-#         device=device,
-#     )
-#     builder = ModelBuilder(strategy)
-#     # Assume 'dataset' is a HuggingFace Dataset with column 'text' and 'label'
-#     artifacts = builder.build_model(dataset)
-#     # artifacts['model'], artifacts['tokenizer'], artifacts['trainer'] can be used for inference
