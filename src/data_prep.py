@@ -35,6 +35,7 @@ def prepare_dataset(
     # Load and preprocess data
     df = pd.read_csv(file_path)
     df = df.dropna(subset=["Abstract"]).reset_index(drop=True)
+    df["rejection"] = df["rejection"].map({"Rejected": 0, "Useful": 1})
 
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_name)
