@@ -41,3 +41,11 @@ if __name__ == "__main__":
     p.add_argument("--email")  # dla pubmed
     args = p.parse_args()
     main(args)
+
+
+# python src/fetch_data.py \
+#   --mode pubmed \
+#   --dataset ./data/raw/amyloid-raw-22-08-2025.csv \
+#   --column PMID \
+#   --output ./data/fetched/pubmed-amyloid-22-08-2025.csv \
+#   --email test@example.com
