@@ -17,6 +17,7 @@ from transformers import (
     set_seed,
 )
 from datasets import Dataset
+from torch import nn
 
 print("model2 :)")
 
@@ -48,9 +49,15 @@ logging.basicConfig(
 
 # ---------- Model configurator with safer attribute access ----------
 class ModelConfigurator:
-    def __init__(self, special_tokens: list[str], unfreeze_last_k_layers: int = 6):
+    def __init__(
+        self,
+        special_tokens: list[str],
+        unfreeze_last_k_layers: int = 6,
+        change_classifier: bool = False,
+    ):
         self.special_tokens = special_tokens
         self.unfreeze_last_k = unfreeze_last_k_layers
+        self.change_classifier = change_classifier
 
     def add_special_tokens(self, tokenizer, model):
         logging.info("Adding special tokens and resizing model embeddings.")
@@ -104,6 +111,50 @@ class ModelConfigurator:
                 for param in layer.parameters():
                     param.requires_grad = True
 
+    def add_two_layer_classifier(
+        self,
+        model,
+        num_classes: int = 2,
+        hidden_size: int = 512,
+        dropout_rate: float = 0.1,
+    ):
+        """
+        Replace the existing classifier with a two-layer MLP classifier.
+
+        Args:
+            model: The transformer model (BERT, RoBERTa, etc.)
+            num_classes: Number of output classes
+            hidden_size: Size of the hidden layer (default: 512)
+            dropout_rate: Dropout rate between layers (default: 0.1)
+        """
+        logging.info(
+            f"Adding two-layer classifier with hidden_size={hidden_size}, num_classes={num_classes}"
+        )
+
+        # Create new two-layer classifier
+        new_classifier = nn.Sequential(
+            nn.Linear(768, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_size, num_classes),
+        )
+
+        # Replace the classifier
+        if hasattr(model, "classifier"):
+            # For BERT-style models
+            if isinstance(model.classifier, nn.Linear):
+                # Simple linear classifier
+                model.classifier = new_classifier
+            else:
+                # Complex classifier head (like RoBERTa)
+                model.classifier = new_classifier
+        else:
+            raise ValueError("Model does not have a 'classifier' attribute")
+
+        logging.info("Two-layer classifier successfully added")
+        return model
+
+
 
 # ---------- Custom Trainer ----------
 class CustomTrainer(Trainer):
@@ -154,12 +205,15 @@ class BERTClassificationStrategy(ModelBuildingStrategy):
         special_tokens: list[str],
         unfreeze_last_k_layers: int,
         device: torch.device = None,
+        change_classifier: bool = False,
     ):
         self.model_name = model_name
         self.num_labels = num_labels
         self.hparams = hparams
         self.device = device
-        self.configurator = ModelConfigurator(special_tokens, unfreeze_last_k_layers)
+        self.configurator = ModelConfigurator(
+            special_tokens, unfreeze_last_k_layers, change_classifier
+        )
         """
         hparams: 
             {
@@ -182,6 +236,10 @@ class BERTClassificationStrategy(ModelBuildingStrategy):
         # Configure tokenizer/model
         self.configurator.add_special_tokens(tokenizer, model)
         self.configurator.freeze_layers(model)
+        if self.configurator.change_classifier:
+            self.configurator.add_two_layer_classifier(
+                model, self.num_labels, self.hparams["classifier_hidden_dim"]
+            )
 
         dataset.set_format(
             type="torch", columns=["input_ids", "attention_mask", "labels"]
