@@ -6,21 +6,21 @@ from tqdm import tqdm
 
 def fetch_references(pmids: Union[List[str], pd.Series]) -> pd.DataFrame:
     """
-    Pobiera listę referencji z OpenAlex dla podanych PMIDs.
+    Fetches a list of references from OpenAlex for the given PMIDs.
 
     Parameters
     ----------
     pmids : Union[List[str], pd.Series]
-        Lista lub pandas Series z identyfikatorami PMID.
+        A list or pandas Series with PMID identifiers.
 
     Returns
     -------
     pd.DataFrame
-        Ramka danych z kolumnami:
-        - pmid: oryginalny PMID
-        - references: lista identyfikatorów prac referencyjnych (np. "W3196964953")
+        DataFrame with the following columns:
+        - pmid: original PMID
+        - references: list of reference work identifiers (e.g. "W3196964953")
     """
-    # Upewnij się, że mamy listę stringów
+    # Ensure we have a list of strings
     if isinstance(pmids, pd.Series):
         pmid_list = pmids.astype(str).tolist()
     else:
@@ -35,15 +35,15 @@ def fetch_references(pmids: Union[List[str], pd.Series]) -> pd.DataFrame:
             resp.raise_for_status()
             data = resp.json()
 
-            # Pobieramy listę referencji
+            # Extract the list of references
             oa_ids = data.get("referenced_works", [])
-            # Wyciągamy tylko część po ostatnim ukośniku
+            # Keep only the part after the last slash
             refs = [oa_id.rsplit("/", 1)[-1] for oa_id in oa_ids]
         except requests.HTTPError as e:
-            print(f"Błąd HTTP dla PMID {pmid}: {e}")
+            print(f"HTTP error for PMID {pmid}: {e}")
             refs = []
         except Exception as e:
-            print(f"Inny błąd dla PMID {pmid}: {e}")
+            print(f"Other error for PMID {pmid}: {e}")
             refs = []
 
         results.append({"pmid": pmid, "references": refs})
@@ -57,7 +57,6 @@ def fetch_references_by_openalex(
 ) -> pd.DataFrame:
     """
     Fetches corresponding PMIDs, DOIs, and a list of references for given OpenAlex IDs.
-    Always displays a progress bar using tqdm.
 
     Parameters
     ----------
