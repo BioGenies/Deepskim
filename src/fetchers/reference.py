@@ -28,7 +28,7 @@ def fetch_references(pmids: Union[List[str], pd.Series]) -> pd.DataFrame:
 
     results = []
 
-    for pmid in pmid_list:
+    for pmid in tqdm(pmid_list, desc="Fetching OpenAlex references", unit="PMID"):
         url = f"https://api.openalex.org/works/pmid:{pmid}"
         try:
             resp = requests.get(url)
@@ -48,8 +48,7 @@ def fetch_references(pmids: Union[List[str], pd.Series]) -> pd.DataFrame:
 
         results.append({"pmid": pmid, "references": refs})
 
-    df = pd.DataFrame(results)
-    return df
+    return pd.DataFrame(results)
 
 
 def fetch_references_by_openalex(
