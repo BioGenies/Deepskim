@@ -4,6 +4,7 @@ from xml.etree import ElementTree as ET
 
 import pandas as pd
 from Bio import Entrez
+from tqdm import tqdm
 
 
 def fetch_pubmed_data(pmids, email, batch_size=200, api_key=None):
@@ -32,7 +33,15 @@ def fetch_pubmed_data(pmids, email, batch_size=200, api_key=None):
     ids = [str(int(x)) for x in pd.Series(pmids).dropna().unique()]
     results = []
 
-    for start in range(0, len(ids), batch_size):
+    # Calculate total number of batches for progress bar
+    total_batches = (len(ids) + batch_size - 1) // batch_size
+
+    for start in tqdm(
+        range(0, len(ids), batch_size),
+        total=total_batches,
+        desc="Fetching PubMed data",
+        unit="batch",
+    ):
         batch = ids[start : start + batch_size]
         handle = Entrez.efetch(db="pubmed", id=",".join(batch), retmode="xml")
         tree = ET.parse(handle)
