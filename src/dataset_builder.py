@@ -17,36 +17,16 @@ def mark_keywords(text: str, keywords: list[str], marker: str = "[KEY]") -> str:
     return text
 
 
-# def preprocess_batch(
-#     examples: Dict, tokenizer: PreTrainedTokenizer, keywords: List[str]
-# ) -> Dict:
-#     """
-#     Example preprocessing: concatenate Journal and Abstract, mark keywords, tokenize.
-#     """
-#     combined_texts = []
-#     for journal, abstract in zip(
-#         examples.get("Journal", []), examples.get("Abstract", [])
-#     ):
-#         text = f"{journal} [JOURNAL_END] {abstract}"
-#         # Assuming a function mark_keywords
-#         text = mark_keywords(text, keywords)
-#         combined_texts.append(text)
-#     return tokenizer(
-#         combined_texts,
+# def preprocess_batch_titles(examples, tokenizer, keywords: list[str], max_length):
+#     marked = [mark_keywords(t, keywords) for t in examples["Title"]]
+#     tok = tokenizer(
+#         marked,
 #         truncation=True,
 #         padding="max_length",
-#         max_length=350,
+#         max_length=max_length,
 #     )
-
-# def preprocess_batch_titles(examples, tokenizer, keywords: list[str]):
-#     titles = [mark_keywords(title, keywords) for title in examples["Title"]]
-#     return tokenizer(
-#         titles,
-#         truncation=True,
-#         padding="max_length",
-#         max_length=32,
-#     )
-
+#     tok["Title2"] = marked
+#     return tok
 
 # def preprocess_batch_abstract(examples, tokenizer, keywords, max_length):
 #     marked = [mark_keywords(a, keywords) for a in examples["Abstract"]]
@@ -58,18 +38,6 @@ def mark_keywords(text: str, keywords: list[str], marker: str = "[KEY]") -> str:
 #     )
 #     tok["Abstract2"] = marked
 #     return tok
-
-
-def preprocess_batch_titles(examples, tokenizer, keywords: list[str], max_length):
-    marked = [mark_keywords(t, keywords) for t in examples["Title"]]
-    tok = tokenizer(
-        marked,
-        truncation=True,
-        padding="max_length",
-        max_length=max_length,
-    )
-    tok["Title2"] = marked
-    return tok
 
 
 def preprocess_batch_abstract(examples, tokenizer, keywords, max_length):
