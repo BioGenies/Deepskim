@@ -155,7 +155,6 @@ class ModelConfigurator:
         return model
 
 
-
 # ---------- Custom Trainer ----------
 class CustomTrainer(Trainer):
     def __init__(self, class_weights, *args, **kwargs):
