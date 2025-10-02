@@ -1,6 +1,6 @@
 import logging
 from abc import ABC, abstractmethod
-from typing import Tuple, List
+from typing import Tuple, List, Union
 import pandas as pd
 from datasets import Dataset, DatasetDict
 import re
@@ -142,3 +142,54 @@ class FoldsConverter(DatasetConverter):
             logging.info(f"Fold {idx}: conversion finished.")
             all_datasets.append(ds)
         return all_datasets
+
+
+class DataFrameConverter(DatasetConverter):
+    def convert(
+        self,
+        splits: Union[pd.DataFrame, Tuple[pd.DataFrame, pd.Series]],
+        tokenizer: PreTrainedTokenizer,
+        keywords: List[str],
+        max_length: int = 350,
+    ) -> DatasetDict:
+        """
+        Convert a single DataFrame (or (X, y)) into a HuggingFace DatasetDict.
+        - If `splits` is a tuple (X, y) we attach y as 'labels'.
+        - If `splits` is a DataFrame and it lacks 'labels', we add 'labels' filled with -1
+          (marker for "no label"; Trainer.predict will still work).
+        Returns: DatasetDict({"test": Dataset})
+        """
+        # Normalize input -> get a DataFrame that always has 'labels' column
+        if isinstance(splits, tuple):
+            X, y = splits
+            df = X.copy()
+            df["labels"] = y.values
+            has_labels = True
+        elif isinstance(splits, pd.DataFrame):
+            df = splits.copy()
+            if "labels" in df.columns:
+                has_labels = True
+            else:
+                # No labels present: create a placeholder column with -1
+                df["labels"] = -1
+                has_labels = False
+        else:
+            raise TypeError(
+                "splits must be a pandas.DataFrame or a (DataFrame, Series) tuple"
+            )
+
+        # Create DatasetDict with single split 'all'
+        dataset = DatasetDict({"test": Dataset.from_pandas(df)})
+
+        dataset = dataset.map(
+            lambda batch: preprocess_batch_abstract(
+                batch, tokenizer, keywords, max_length
+            ),
+            batched=True,
+        )
+
+        logging.info(
+            "Converted DataFrame into DatasetDict with single split 'test'. has_labels=%s",
+            has_labels,
+        )
+        return dataset

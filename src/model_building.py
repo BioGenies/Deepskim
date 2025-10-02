@@ -19,7 +19,7 @@ from transformers import (
 from datasets import Dataset
 from torch import nn
 
-print("model2 :)")
+print("Imported model building :)")
 
 
 # ---------- Reproducibility helper ----------
