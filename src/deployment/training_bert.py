@@ -4,7 +4,7 @@ from copy import deepcopy
 import wandb
 
 from .prepare_data import prepare_dataset
-from model_building import BERTClassificationStrategy
+from training.bert_model_building import BERTClassificationStrategy
 
 
 model_name = "microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract"

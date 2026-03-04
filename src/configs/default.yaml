@@ -1,0 +1,44 @@
+seed: 1
+device: "cuda"  # "cuda" or "cpu"
+wandb_project_name: "Amyloid-test"
+
+data:
+  train_file_path: "train_data.csv"
+  test_file_path: "test_data.csv"
+  target: "labels"
+  test_size: 0.15
+  model_name: "microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract"
+  max_length: 380
+  keywords:
+    - "aggregates"
+    - "amyloid"
+    - "scfv"
+    - "hiapp"
+    - "mab"
+    - "ttr"
+    - "donanemab"
+    - "aggregation"
+  special_tokens:
+    - "[KEY]"
+    - "[J_END]"
+    - "[T_END]"
+  seed: 1
+
+model:
+  model_name: "microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract"
+  num_labels: 2
+  special_tokens:
+    - "[KEY]"
+    - "[J_END]"
+    - "[T_END]"
+  unfreeze_last_k_layers: 12
+  change_classifier: false
+
+training:
+  hparams:
+    learning_rate: 3e-5
+    num_train_epochs: 1
+    per_device_train_batch_size: 16
+    weight_decay: 0.1
+    classifier_hidden_dim: 512
+    warmup_ratio: 0.1

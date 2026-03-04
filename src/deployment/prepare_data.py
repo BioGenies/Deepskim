@@ -2,8 +2,8 @@ import pandas as pd
 from transformers import AutoTokenizer
 import logging
 
-from data_splitter import DataSplitter, TrainTestSplit
-from dataset_builder import TrainTestConverter, DataFrameConverter
+from data.data_splitter import DataSplitter, TrainTestSplit
+from data.dataset_builder import TrainTestConverter, DataFrameConverter
 
 
 def prepare_dataset(

@@ -7,12 +7,13 @@ operate on these objects in memory (fetching, merge).
 from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, Optional
+import os
 
 import warnings
 import pandas as pd
 
 from fetchers import fetch_pubmed_data
-from fetch_data import load_pmid_list
+from data.fetch_data import load_pmid_list
 
 
 class Integrator:
@@ -96,7 +97,12 @@ class Integrator:
             raise RuntimeError(
                 "Function fetch_pubmed_data is not available (check imports)."
             )
-
+        if os.path.exists(save_path):
+            print(f"dataset already available at {save_path} - skipping fetching from pubmed and loading directly")
+            fetched_df = pd.read_csv(save_path)
+            self.fetched_df = fetched_df
+            return
+        
         pmid_col = pmid_column or self.pmid_col
 
         # Obtaining the list of PMIDs:

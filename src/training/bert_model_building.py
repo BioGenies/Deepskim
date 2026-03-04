@@ -19,27 +19,8 @@ from transformers import (
 from datasets import Dataset
 from torch import nn
 
-print("Imported model building :)")
 
-
-# ---------- Reproducibility helper ----------
-def set_global_seed(seed: int):
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    # transformers helper
-    set_seed(seed)
-    # Torch deterministic flags (may impact performance / availability)
-    try:
-        torch.use_deterministic_algorithms(True)
-    except Exception:
-        # fallback for older torch versions
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
+from .base import ModelBuildingStrategy, CustomTrainer
 
 # ---------- Logging ----------
 logging.basicConfig(
@@ -48,7 +29,7 @@ logging.basicConfig(
 
 
 # ---------- Model configurator with safer attribute access ----------
-class ModelConfigurator:
+class BertModelConfigurator:
     def __init__(
         self,
         special_tokens: list[str],
@@ -155,22 +136,6 @@ class ModelConfigurator:
         return model
 
 
-# ---------- Custom Trainer ----------
-class CustomTrainer(Trainer):
-    def __init__(self, class_weights, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.class_weights = class_weights
-
-    def compute_loss(
-        self, model, inputs, return_outputs=False, num_items_in_batch=None
-    ):
-        labels = inputs.get("labels")
-        outputs = model(**inputs)
-        logits = outputs.get("logits")
-        loss = F.cross_entropy(logits, labels, weight=self.class_weights)
-        return (loss, outputs) if return_outputs else loss
-
-
 # ---------- Metrics (safe for binary; change average for multiclass) ----------
 def compute_metrics(pred):
     labels = pred.label_ids
@@ -181,17 +146,6 @@ def compute_metrics(pred):
         "recall": recall_score(labels, preds, average="binary", zero_division=0),
         "f1": f1_score(labels, preds, average="binary", zero_division=0),
     }
-
-
-# ---------- Strategy / Builder ----------
-class ModelBuildingStrategy(ABC):
-    @abstractmethod
-    def build_and_train_model(self, dataset: Dataset) -> Dict[str, Any]:
-        """
-        Train a model on a single HuggingFace Dataset and return objects needed for inference.
-        Returns a dict containing at least: {'model': model, 'tokenizer': tokenizer, 'trainer': trainer}
-        """
-        pass
 
 
 # Concrete Strategy for fine-tuning BERT-based classifier on one dataset
@@ -210,7 +164,7 @@ class BERTClassificationStrategy(ModelBuildingStrategy):
         self.num_labels = num_labels
         self.hparams = hparams
         self.device = device
-        self.configurator = ModelConfigurator(
+        self.configurator = BertModelConfigurator(
             special_tokens, unfreeze_last_k_layers, change_classifier
         )
         """
@@ -224,7 +178,7 @@ class BERTClassificationStrategy(ModelBuildingStrategy):
             }
         """
 
-    def build_and_train_model(self, dataset: Dataset) -> Dict[str, Any]:
+    def build_and_train_model(self, dataset: Dataset, report_to: list[str]=['wandb']) -> Dict[str, Any]:
         # Load tokenizer and model
         tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         model = AutoModelForSequenceClassification.from_pretrained(
@@ -253,7 +207,7 @@ class BERTClassificationStrategy(ModelBuildingStrategy):
             per_device_train_batch_size=self.hparams["per_device_train_batch_size"],
             per_device_eval_batch_size=16,
             num_train_epochs=self.hparams["num_train_epochs"],
-            learning_rate=self.hparams["learning_rate"],
+            learning_rate=float(self.hparams["learning_rate"]),
             weight_decay=self.hparams["weight_decay"],
             warmup_ratio=self.hparams["warmup_ratio"],
             logging_steps=10,
@@ -262,7 +216,7 @@ class BERTClassificationStrategy(ModelBuildingStrategy):
             metric_for_best_model="f1",
             greater_is_better=True,
             fp16=self.device.type == "cuda",
-            report_to=["wandb"],
+            report_to=report_to,
             seed=42,
         )
 
@@ -288,15 +242,3 @@ class BERTClassificationStrategy(ModelBuildingStrategy):
         return {"model": model, "tokenizer": tokenizer, "trainer": trainer}
 
 
-# Context Class to use strategy
-class ModelBuilder:
-    def __init__(self, strategy: ModelBuildingStrategy):
-        self._strategy = strategy
-
-    def set_strategy(self, strategy: ModelBuildingStrategy):
-        logging.info("Switching model building strategy.")
-        self._strategy = strategy
-
-    def build_model(self, dataset: Dataset) -> Dict[str, Any]:
-        logging.info("Building and training the model on single dataset.")
-        return self._strategy.build_and_train_model(dataset)

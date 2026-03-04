@@ -1,6 +1,6 @@
-from .data_splitter import DataSplitter, TrainTestSplit, StratifiedKFoldSplit
-from .dataset_builder import TrainTestConverter, FoldsConverter, DataFrameConverter
-from .model_building import ModelBuilder, BERTClassificationStrategy
+from .data.data_splitter import DataSplitter, TrainTestSplit, StratifiedKFoldSplit
+from .data.dataset_builder import TrainTestConverter, FoldsConverter, DataFrameConverter
+from .training.bert_model_building import BERTClassificationStrategy
 
 __all__ = [
     "DataSplitter",
@@ -9,6 +9,5 @@ __all__ = [
     "TrainTestConverter",
     "FoldsConverter",
     "DataFrameConverter",
-    "ModelBuilder",
     "BERTClassificationStrategy",
 ]
