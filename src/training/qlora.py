@@ -42,7 +42,7 @@ explain_pred_list = []
 def compute_metrics(
     eval_preds, tokenizer, compute_result, shift=True, explainability=False
 ):
-    global y_true_list, y_pred_list, scores_list, reason_true_list, reason_pred_list
+    global y_true_list, y_pred_list, scores_list, explain_true_list, explain_pred_list
     # Compute include/exclude (yes/no) metrics only
     logits = eval_preds.predictions  # [batch, seq_len,, vocab]
     labels = eval_preds.label_ids  # [batch, seq_len]
