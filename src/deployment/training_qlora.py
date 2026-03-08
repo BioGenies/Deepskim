@@ -3,7 +3,12 @@ from copy import deepcopy
 import math
 import torch
 from torch.amp import autocast
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, set_seed
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    set_seed,
+)
 from datasets import DatasetDict, Dataset, concatenate_datasets
 from peft import PeftModel
 
@@ -29,6 +34,7 @@ from training.qlora import QLora
 #             tokenized_dataset.append({"input_ids": input_ids, "completion_mask": completion_mask, "prompt": item['prompt'], "completion": item['completion']})
 #         return Dataset.from_list(tokenized_dataset)
 
+
 def oversample_yes(dataset, positive_ratio=0.5):
     yes_ds = dataset.filter(lambda x: x["completion"].startswith("yes"))
     no_ds = dataset.filter(lambda x: x["completion"].startswith("no"))
@@ -42,7 +48,9 @@ def oversample_yes(dataset, positive_ratio=0.5):
 
     r = float(positive_ratio)
     if not (0.0 <= r < 1.0):
-        raise ValueError("positive_ratio must be in [0.0, 1.0) when only upsampling is allowed")
+        raise ValueError(
+            "positive_ratio must be in [0.0, 1.0) when only upsampling is allowed"
+        )
 
     current_frac = n_yes / total if total > 0 else 0.0
 
@@ -52,7 +60,9 @@ def oversample_yes(dataset, positive_ratio=0.5):
 
     # Need to upsample the positive (yes) class to achieve r in the final set.
     if n_yes == 0:
-        raise ValueError("Cannot upsample positives: no positive examples present in dataset")
+        raise ValueError(
+            "Cannot upsample positives: no positive examples present in dataset"
+        )
 
     # Solve for x: (n_yes + x) / (total + x) = r  =>  x = (r*total - n_yes) / (1 - r)
     numerator = r * total - n_yes
@@ -72,6 +82,7 @@ def oversample_yes(dataset, positive_ratio=0.5):
     balanced = concatenate_datasets([yes_adjusted, no_ds]).shuffle()
     return balanced
 
+
 def tokenize_fn_train(example, tokenizer, max_length=4096):
     prompt = example["prompt"]
     completion = example["completion"]
@@ -84,15 +95,11 @@ def tokenize_fn_train(example, tokenizer, max_length=4096):
     # Create labels (mask out the prompt, keep completion including EOS)
     labels = [-100] * len(prompt_ids) + completion_ids
 
-    if completion_ids[-1] == tokenizer.eos_token_id: 
-        labels[-1] = -100 # Mask out EOS token - not relevant for loss
+    if completion_ids[-1] == tokenizer.eos_token_id:
+        labels[-1] = -100  # Mask out EOS token - not relevant for loss
     attention_mask = [1] * len(input_ids)
 
-    return {
-        "input_ids": input_ids,
-        "labels": labels,
-        "attention_mask": attention_mask
-    }
+    return {"input_ids": input_ids, "labels": labels, "attention_mask": attention_mask}
 
 
 def tokenize_fn_val(example, tokenizer):
@@ -102,11 +109,10 @@ def tokenize_fn_val(example, tokenizer):
     if prompt_ids[-1] == tokenizer.eos_token_id:
         prompt_ids = prompt_ids[:-1]
 
-    input_ids = prompt_ids 
-
+    input_ids = prompt_ids
 
     # Create labels (mask out the prompt)
-    labels = [-100] * len(prompt_ids) 
+    labels = [-100] * len(prompt_ids)
 
     attention_mask = [1] * len(input_ids)
 
@@ -115,6 +121,7 @@ def tokenize_fn_val(example, tokenizer):
         "labels": labels,
         "attention_mask": attention_mask,
     }
+
 
 def train_model(config):
 
@@ -128,46 +135,51 @@ def train_model(config):
 
     print("Using device:", device)
 
-
     run_name = (
         f"{config['run_name']}_model_{config['model']['model_name']}_lr{config['peft']['sft_config']['learning_rate']}"
         f"_peft_"
     )
 
     # ------- Load dataset -------
-    train_val, test = prepare_dataset(**config["data"])
+    train_val, _ = prepare_dataset(**config["data"])
 
     dtype_str = config["model"]["bnb_4bit_compute_dtype"]  # "bfloat16"
-    compute_dtype = getattr(torch, dtype_str)  
+    compute_dtype = getattr(torch, dtype_str)
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=config["model"]["load_in_4bit"],
         bnb_4bit_quant_type=config["model"]["bnb_4bit_quant_type"],
         bnb_4bit_compute_dtype=compute_dtype,
         bnb_4bit_use_double_quant=config["model"]["bnb_4bit_use_double_quant"],
-        )
-    model = AutoModelForCausalLM.from_pretrained(config["model"]["model_name"], 
-                                                 device_map=config["model"]["device_map"], 
-                                                 quantization_config=bnb_config,
-                                                 use_cache=False)
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        config["model"]["model_name"],
+        device_map=config["model"]["device_map"],
+        quantization_config=bnb_config,
+        use_cache=False,
+    )
     tokenizer = AutoTokenizer.from_pretrained(config["model"]["model_name"])
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    train_dataset = train_val['train'].map(lambda x: tokenize_fn_train(x, tokenizer), batched=False)
+    train_dataset = train_val["train"].map(
+        lambda x: tokenize_fn_train(x, tokenizer), batched=False
+    )
     # train_dataset = oversample_yes(train_dataset, positive_ratio=config["data"]["positive_ratio"])
-    val_dataset = train_val['test'].map(lambda x: tokenize_fn_train(x, tokenizer), batched=False)
-    
+    val_dataset = train_val["test"].map(
+        lambda x: tokenize_fn_train(x, tokenizer), batched=False
+    )
+
     # val_dataset = train_val['test'].map(lambda x: tokenize_fn_val(x, tokenizer), batched=False, remove_columns=['prompt', 'completion'])
     print(f"Model {config['model']['model_name']} loaded.")
-    config['peft']['sft_config']['run_name'] = run_name
-    qlora = QLora(model=model,
-                  tokenizer=tokenizer,
-                  lora_config=config["peft"]["lora_config"],
-                  sft_config=config["peft"]["sft_config"],
-                  train_dataset=train_dataset,
-                  eval_dataset=val_dataset,
-                  device=device)
-
+    config["peft"]["sft_config"]["run_name"] = run_name
+    qlora = QLora(
+        model=model,
+        tokenizer=tokenizer,
+        lora_config=config["peft"]["lora_config"],
+        sft_config=config["peft"]["sft_config"],
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        device=device,
+    )
 
     # ------- Build & train -------
     qlora.train_model()
-

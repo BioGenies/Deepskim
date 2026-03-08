@@ -37,12 +37,8 @@ def prepare_raw(
     to_drop = [col for col in preprocessor.df.columns if "Unnamed" in col]
     preprocessor.df = preprocessor.df.drop(columns=to_drop)
     preprocessor.df = preprocessor.df.drop(columns=["Year.1"])
-
-
-
+    
     preprocessor.df.to_csv(preprocessed_save_path, index=False)
-
-    return
 
 
 

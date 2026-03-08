@@ -15,7 +15,6 @@ def main(args):
 
     config = yaml.safe_load(open(config, "r"))
 
-
     set_seed(config.get("seed", 42))
     if "peft" in config and config["peft"]["method"] == "lora":
         print("Training with QLoRA...")
@@ -32,4 +31,3 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, default=None, help="Path to config file")
     args = parser.parse_args()
     main(args)
-
