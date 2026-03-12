@@ -10,13 +10,14 @@ from datasets import Dataset, DatasetDict
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.data import WeightedRandomSampler
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
 )
 from peft import LoraConfig
 from trl import SFTTrainer, SFTConfig
-from sklearn.metrics import precision_score, recall_score, f1_score
+from sklearn.metrics import precision_score, recall_score, f1_score, average_precision_score, confusion_matrix
 
 from .bert_model_building import compute_metrics
 from utils.evaluation import (
@@ -111,6 +112,10 @@ def compute_metrics(
         scores = np.concatenate(scores_list, 0)
         explain_true = np.concatenate(explain_true_list, 0)
         explain_pred = np.concatenate(explain_pred_list)
+        reason_macro_f1 = f1_score(explain_true, explain_pred, average="macro", zero_division=0)
+        reason_cm = confusion_matrix(explain_true, explain_pred)
+        print(f"Reason macro-F1: {reason_macro_f1:.4f}")
+        print(f"Reason confusion matrix:\n{reason_cm}")
         metrics = {
             "accuracy": float((y_pred == y_true).mean()),
             "precision": precision_score(y_true, y_pred, zero_division=0),
@@ -119,7 +124,9 @@ def compute_metrics(
             "% to review for 95% recall": percent_to_review_for_recall(
                 list(zip(y_pred, scores)), y_true, recall_target=0.95
             ),
+            "average_precision": average_precision_score(y_true, scores),
             "explain_accuracy": float((explain_pred == explain_true).mean()),
+            "reason_macro_f1": reason_macro_f1,
         }
         y_true_list = []
         y_pred_list = []
@@ -140,6 +147,7 @@ class QLora:
         train_dataset: Dataset,
         device: torch.device = torch.device("cpu"),
         eval_dataset: Dataset = None,
+        positive_ratio: float = 0.3,
     ):
         self.model = model
         # self.num_labels = num_labels
@@ -156,6 +164,7 @@ class QLora:
             args=self.sft_config,
             peft_config=self.lora_config,
             eval_dataset=eval_dataset,
+            positive_ratio=positive_ratio,
         )
 
     def train_model(self):
@@ -192,19 +201,65 @@ class WeightedCESFTTrainer(SFTTrainer):
 
 
 class WeightedCEExplainSFTTrainer(SFTTrainer):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, positive_ratio: float = 0.3, **kwargs):
         super().__init__(*args, **kwargs)
         self.lambda_decision = 2
         self.lambda_reason = 1
-        self.lambda_struct = 0.1
+        self.lambda_struct = 0.01
+        self.positive_ratio = positive_ratio
         self._last_sub_losses: Dict[str, float] = {}
+        self._eval_sub_loss_accum: Dict[str, float] = {}
+        self._eval_sub_loss_count: int = 0
 
     def log(self, logs: Dict[str, float], start_time: float = None) -> None:
-        logs.update(self._last_sub_losses)
+        is_eval = any(k.startswith("eval_") for k in logs)
+        if is_eval and self._eval_sub_loss_count > 0:
+            avg = {
+                f"eval_{k}": v / self._eval_sub_loss_count
+                for k, v in self._eval_sub_loss_accum.items()
+            }
+            logs.update(avg)
+            self._eval_sub_loss_accum = {}
+            self._eval_sub_loss_count = 0
+        elif not is_eval:
+            logs.update(self._last_sub_losses)
         if start_time is not None:
             super().log(logs, start_time=start_time)
         else:
             super().log(logs)
+
+    def get_train_dataloader(self):
+        dataset = self.train_dataset
+        # Determine per-example weight: positives get upweighted so they appear
+        # at roughly `positive_ratio` frequency in each batch.
+        is_positive = [
+            "yes" in str(ex.get("completion", ex.get("labels", ""))) for ex in dataset
+        ]
+        n_pos = sum(is_positive)
+        n_neg = len(is_positive) - n_pos
+        if n_pos == 0 or n_neg == 0:
+            return super().get_train_dataloader()
+        r = self.positive_ratio
+        w_pos = r / n_pos
+        w_neg = (1.0 - r) / n_neg
+        weights = [w_pos if p else w_neg for p in is_positive]
+        sampler = WeightedRandomSampler(
+            weights, num_samples=len(weights), replacement=True
+        )
+        logging.info(
+            f"WeightedRandomSampler: {n_pos} positives, {n_neg} negatives, "
+            f"target positive_ratio={r:.2f}"
+        )
+        data_collator = self.data_collator
+        return torch.utils.data.DataLoader(
+            dataset,
+            batch_size=self._train_batch_size,
+            sampler=sampler,
+            collate_fn=data_collator,
+            drop_last=self.args.dataloader_drop_last,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+        )
 
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
@@ -257,19 +312,29 @@ class WeightedCEExplainSFTTrainer(SFTTrainer):
 
         loss_reason = F.cross_entropy(reason_logits.view(B, V), reason_labels.view(-1))
 
-        # Add a small overall loss to enforce structure
-        loss_struct = F.cross_entropy(logits.view(B * T, V), labels.view(B * T))
+        # Add a small overall loss to enforce structure (middle tokens only, not decision/reason)
+        if T > 2:
+            loss_struct = F.cross_entropy(
+                logits[:, 1:-1, :].reshape(-1, V), labels[:, 1:-1].reshape(-1)
+            )
+        else:
+            loss_struct = torch.tensor(0.0, device=model.device)
         loss = (
             self.lambda_decision * loss_include
             + self.lambda_reason * loss_reason
             + self.lambda_struct * loss_struct
         )
 
-        self._last_sub_losses = {
+        sub_losses = {
             "loss_decision": loss_include.detach().item(),
             "loss_reason": loss_reason.detach().item(),
             "loss_struct": loss_struct.detach().item(),
         }
+        self._last_sub_losses = sub_losses
+        if not self.model.training:
+            for k, v in sub_losses.items():
+                self._eval_sub_loss_accum[k] = self._eval_sub_loss_accum.get(k, 0.0) + v
+            self._eval_sub_loss_count += 1
 
         return (loss, outputs) if return_outputs else loss
 

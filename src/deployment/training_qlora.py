@@ -179,6 +179,7 @@ def train_model(config):
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         device=device,
+        positive_ratio=config["data"].get("positive_ratio", 0.3),
     )
 
     # ------- Build & train -------

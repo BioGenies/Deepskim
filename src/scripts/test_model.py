@@ -17,7 +17,14 @@ from transformers import (
 from torch.amp import autocast
 from peft import PeftModel
 from tqdm import tqdm
-from sklearn.metrics import precision_score, recall_score, f1_score
+from sklearn.metrics import (
+    precision_score,
+    recall_score,
+    f1_score,
+    average_precision_score,
+    confusion_matrix,
+    classification_report,
+)
 
 
 from data.dataset_qlora import prepare_dataset
@@ -57,7 +64,7 @@ def evaluate_model(config, checkpoint_path=None, save_false_preds=False):
 
     # ---------- Load dataset ----------
     train, test = prepare_dataset(**config["data"])
-    # test = train['test'] # Check that the training and evaluation are implemented okay
+    # test = train["test"]  # Check that the training and evaluation are implemented okay
 
     # ---------- Quantization ----------
     bnb_config = BitsAndBytesConfig(
@@ -89,6 +96,8 @@ def evaluate_model(config, checkpoint_path=None, save_false_preds=False):
     preds = []
     labels = []
     scores = []
+    reason_preds = []
+    reason_labels = []
     map_dict = {"yes": 1, "no": 0}
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=config["model"]["load_in_4bit"],
@@ -153,6 +162,16 @@ def evaluate_model(config, checkpoint_path=None, save_false_preds=False):
             preds.append(pred_labels.item())
             label = re.search(r"^(yes)|(no)", ex["completion"][0]).group(0)
             labels.append(map_dict[label])
+            reason_match_pred = re.search(r"reason: (\w+)", generated_text)
+            reason_match_true = re.search(r"reason: (\w+)", ex["completion"][0])
+            if (
+                reason_match_pred
+                and reason_match_true
+                and reason_match_true.group(1) != "Rn"
+                and reason_match_pred.group(1) != "Rn"
+            ):  # Exclude positive samples - the reason is a placeholder
+                reason_preds.append(reason_match_pred.group(1))
+                reason_labels.append(reason_match_true.group(1))
             # eval_preds = eval_obj(predictions=pred.unsqueeze(0), label_ids=label_ids)
             # compute_result = idx == len(loader) - 1
             # metrics = compute_metrics(eval_preds, tokenizer, compute_result=compute_result, shift=False)
@@ -162,7 +181,7 @@ def evaluate_model(config, checkpoint_path=None, save_false_preds=False):
             # print()
             # if metrics is not None:
             #     print(metrics)
-    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+    from sklearn.metrics import accuracy_score
 
     accuracy = accuracy_score(labels, preds)
     precision = precision_score(labels, preds, zero_division=0)
@@ -171,6 +190,7 @@ def evaluate_model(config, checkpoint_path=None, save_false_preds=False):
     percent_to_review = percent_to_review_for_recall(
         list(zip(preds, scores)), labels, recall_target=0.95
     )
+    avg_precision = average_precision_score(labels, scores)
     print(
         f"Final Evaluation Metrics at threshold {config['evaluation']['decision_threshold']}:"
     )
@@ -178,7 +198,18 @@ def evaluate_model(config, checkpoint_path=None, save_false_preds=False):
     print(f"Precision: {precision:.4f}")
     print(f"Recall:    {recall:.4f}")
     print(f"F1 Score:  {f1:.4f}")
+    print(f"Average Precision: {avg_precision:.4f}")
     print(f"Percent to review for 95% recall: {percent_to_review:.2f}%")
+    if reason_preds:
+        reason_macro_f1 = f1_score(
+            reason_labels, reason_preds, average="macro", zero_division=0
+        )
+        reason_cm = confusion_matrix(reason_labels, reason_preds)
+        print(f"Reason Macro-F1: {reason_macro_f1:.4f}")
+        print(
+            f"Reason per-class metrics:\n{classification_report(reason_labels, reason_preds, zero_division=0)}"
+        )
+        print(f"Reason Confusion Matrix:\n{reason_cm}")
 
     if save_false_preds:
         strong_fps = []
