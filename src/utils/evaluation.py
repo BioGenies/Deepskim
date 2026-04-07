@@ -1,12 +1,15 @@
 import torch
 
+
 def gather_yes_no_logprobs(logprobs, tokenizer):
     # logprobs: [batch, vocab_size]
     yes_id = tokenizer.encode("yes", add_special_tokens=False)[0]
-    no_id  = tokenizer.encode("no",  add_special_tokens=False)[0]
+    no_id = tokenizer.encode("no", add_special_tokens=False)[0]
     gather_idx = torch.tensor([no_id, yes_id], device=logprobs.device)
 
-    gathered = logprobs[..., gather_idx] # gathered: [batch, seq_len] or [batch, seq_len, 2] depending on input shape
+    gathered = logprobs[
+        ..., gather_idx
+    ]  # gathered: [batch, seq_len] or [batch, seq_len, 2] depending on input shape
     return gathered
 
 
@@ -27,9 +30,11 @@ def find_best_threshold(yes_probs, y_true):
 
     return best_threshold, best_f1
 
+
 def convert_scores_to_probs(yes_no_scores):
-    yes_probs = torch.sigmoid(yes_no_scores[:,1] - yes_no_scores[:,0])
+    yes_probs = torch.sigmoid(yes_no_scores[:, 1] - yes_no_scores[:, 0])
     return yes_probs
+
 
 def convert_probs_to_labels(yes_probs, tokenizer, threshold=0.5):
     y_pred = (yes_probs >= threshold).to(int)
@@ -82,4 +87,3 @@ def percent_to_review_for_recall(preds_with_conf, y_true, recall_target=0.95):
 
     # If loop completes, all records are needed
     return 100.0
-

@@ -43,7 +43,7 @@ def tokenize_fn_val(example, tokenizer):
     prompt = example["prompt"]
 
     prompt_ids = tokenizer(prompt, add_special_tokens=True)["input_ids"]
-    if prompt_ids[-1] == tokenizer.eos_token:
+    if prompt_ids[-1] == tokenizer.eos_token_id:
         prompt_ids = prompt_ids[:-1]
 
     input_ids = prompt_ids
@@ -64,7 +64,7 @@ def evaluate_model(config, checkpoint_path=None, save_false_preds=False):
 
     # ---------- Load dataset ----------
     train, test = prepare_dataset(**config["data"])
-    # test = train["test"]  # Check that the training and evaluation are implemented okay
+    test = train["test"]  # Check that the training and evaluation are implemented okay
 
     # ---------- Quantization ----------
     bnb_config = BitsAndBytesConfig(
@@ -99,10 +99,12 @@ def evaluate_model(config, checkpoint_path=None, save_false_preds=False):
     reason_preds = []
     reason_labels = []
     map_dict = {"yes": 1, "no": 0}
+    dtype_str = config["model"]["bnb_4bit_compute_dtype"]  # "bfloat16"
+    compute_dtype = getattr(torch, dtype_str)
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=config["model"]["load_in_4bit"],
         bnb_4bit_quant_type=config["model"]["bnb_4bit_quant_type"],
-        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_compute_dtype=compute_dtype,
         bnb_4bit_use_double_quant=config["model"]["bnb_4bit_use_double_quant"],
     )
     model = AutoModelForCausalLM.from_pretrained(
@@ -114,7 +116,7 @@ def evaluate_model(config, checkpoint_path=None, save_false_preds=False):
     model = PeftModel.from_pretrained(model, checkpoint_path)
     eval_obj = namedtuple("EvalObj", ["predictions", "label_ids"])
     with torch.inference_mode():
-        for ex in tqdm(loader, desc="Evaluating", total=len(loader)):
+        for idx, ex in enumerate(tqdm(loader, desc="Evaluating", total=len(loader))):
             # move inputs to the configured device (and keep dtypes correct)
             # inputs = tokenizer(ex['prompt'], add_special_tokens=False, return_tensors='pt')
             inputs = deepcopy(ex)
@@ -132,84 +134,103 @@ def evaluate_model(config, checkpoint_path=None, save_false_preds=False):
                     return_dict_in_generate=True,
                     output_scores=True,
                 )
-
-            # Decode only the generated tokens (skip input)
-            input_length = inputs["input_ids"].shape[1]
-            generated_ids = outputs[0][..., input_length:]
-            generated_ids = generated_ids.squeeze()
-            generated_text = tokenizer.decode(
-                generated_ids, skip_special_tokens=True
-            ).strip()
-            label_ids = (
-                torch.tensor(
-                    (
-                        tokenizer(ex["completion"], add_special_tokens=False)[
-                            "input_ids"
-                        ][0]
-                    )
-                )[0]
-                .unsqueeze(0)
-                .unsqueeze(0)
+            predictions = torch.cat(outputs[1])
+            predictions = predictions.unsqueeze(0).to("cpu")
+            labels = tokenizer(ex["completion"], add_special_tokens=False)["input_ids"]
+            labels = torch.tensor(labels).unsqueeze(0)
+            compute_tuple = eval_obj(predictions=predictions, label_ids=labels)
+            ret_metrics = idx == len(loader) - 1
+            ret = compute_metrics(
+                compute_tuple,
+                compute_result=ret_metrics,
+                explainability=True,
+                tokenizer=tokenizer,
+                shift=False,
             )
-            pred = gather_yes_no_logprobs(outputs.scores[0], tokenizer)
-            pred_scores = convert_scores_to_probs(pred)
-            pred_labels = convert_probs_to_labels(
-                pred_scores,
-                tokenizer,
-                threshold=config["evaluation"]["decision_threshold"],
-            )
-            scores.append(pred_scores.item())
-            preds.append(pred_labels.item())
-            label = re.search(r"^(yes)|(no)", ex["completion"][0]).group(0)
-            labels.append(map_dict[label])
-            reason_match_pred = re.search(r"reason: (\w+)", generated_text)
-            reason_match_true = re.search(r"reason: (\w+)", ex["completion"][0])
-            if (
-                reason_match_pred
-                and reason_match_true
-                and reason_match_true.group(1) != "Rn"
-                and reason_match_pred.group(1) != "Rn"
-            ):  # Exclude positive samples - the reason is a placeholder
-                reason_preds.append(reason_match_pred.group(1))
-                reason_labels.append(reason_match_true.group(1))
-            # eval_preds = eval_obj(predictions=pred.unsqueeze(0), label_ids=label_ids)
-            # compute_result = idx == len(loader) - 1
-            # metrics = compute_metrics(eval_preds, tokenizer, compute_result=compute_result, shift=False)
-            # print("PROMPT :", ex["prompt"])
-            # print("TARGET :", ex["completion"])
-            # print("PRED   :", generated_text)
-            # print()
-            # if metrics is not None:
-            #     print(metrics)
-    from sklearn.metrics import accuracy_score
+            if ret:
+                print(ret)
+            # # Decode only the generated tokens (skip input)
+            # input_length = inputs["input_ids"].shape[1]
+            # generated_ids = outputs[0][..., input_length:]
+            # generated_ids = generated_ids.squeeze()
+            # generated_text = tokenizer.decode(
+            #     generated_ids, skip_special_tokens=True
+            # ).strip()
+            # label_ids = (
+            #     torch.tensor(
+            #         (
+            #             tokenizer(ex["completion"], add_special_tokens=False)[
+            #                 "input_ids"
+            #             ][0]
+            #         )
+            #     )[0]
+            #     .unsqueeze(0)
+            #     .unsqueeze(0)
+            # )
 
-    accuracy = accuracy_score(labels, preds)
-    precision = precision_score(labels, preds, zero_division=0)
-    recall = recall_score(labels, preds, zero_division=0)
-    f1 = f1_score(labels, preds, zero_division=0)
-    percent_to_review = percent_to_review_for_recall(
-        list(zip(preds, scores)), labels, recall_target=0.95
-    )
-    avg_precision = average_precision_score(labels, scores)
-    print(
-        f"Final Evaluation Metrics at threshold {config['evaluation']['decision_threshold']}:"
-    )
-    print(f"Accuracy:  {accuracy:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall:    {recall:.4f}")
-    print(f"F1 Score:  {f1:.4f}")
-    print(f"Average Precision: {avg_precision:.4f}")
-    print(f"Percent to review for 95% recall: {percent_to_review:.2f}%")
-    if reason_preds:
-        reason_macro_f1 = f1_score(
-            reason_labels, reason_preds, average="macro", zero_division=0
-        )
-        reason_cm = confusion_matrix(reason_labels, reason_preds)
-        print(f"Reason Macro-F1: {reason_macro_f1:.4f}")
-        print(
-            f"Reason per-class metrics:\n{classification_report(reason_labels, reason_preds, zero_division=0)}"
-        )
-        print(f"Reason Confusion Matrix:\n{reason_cm}")
+            # pred = gather_yes_no_logprobs(outputs.scores[-1], tokenizer)
+            # pred_scores = convert_scores_to_probs(pred)
+            # pred_labels = convert_probs_to_labels(
+            #     pred_scores,
+            #     tokenizer,
+            #     threshold=config["evaluation"]["decision_threshold"],
+            # )
+            # pred_labels = map_dict[tokenizer.decode(generated_ids[-1])]
+    #         print(generated_text)
+    #         print(ex["completion"])
+    #         print(generated_ids[-1])
+    #         scores.append(pred_scores.item())
+    #         preds.append(pred_labels)
+    #         label = re.search(r"(yes)|(no)", ex["completion"][0]).group(0)
+    #         labels.append(map_dict[label])
+    #         reason_match_pred = re.search(r"reason: (\w+)", generated_text)
+    #         reason_match_true = re.search(r"reason: (\w+)", ex["completion"][0])
+    #         if (
+    #             reason_match_pred
+    #             and reason_match_true
+    #             and reason_match_true.group(1) != "Rn"
+    #             and reason_match_pred.group(1) != "Rn"
+    #         ):  # Exclude positive samples - the reason is a placeholder
+    #             reason_preds.append(reason_match_pred.group(1))
+    #             reason_labels.append(reason_match_true.group(1))
+    #         # eval_preds = eval_obj(predictions=pred.unsqueeze(0), label_ids=label_ids)
+    #         # compute_result = idx == len(loader) - 1
+    #         # metrics = compute_metrics(eval_preds, tokenizer, compute_result=compute_result, shift=False)
+    #         # print("PROMPT :", ex["prompt"])
+    #         # print("TARGET :", ex["completion"])
+    #         # print("PRED   :", generated_text)
+    #         # print()
+    #         # if metrics is not None:
+    #         #     print(metrics)
+    # from sklearn.metrics import accuracy_score
+
+    # accuracy = accuracy_score(labels, preds)
+    # precision = precision_score(labels, preds, zero_division=0)
+    # recall = recall_score(labels, preds, zero_division=0)
+    # f1 = f1_score(labels, preds, zero_division=0)
+    # percent_to_review = percent_to_review_for_recall(
+    #     list(zip(preds, scores)), labels, recall_target=0.95
+    # )
+    # avg_precision = average_precision_score(labels, scores)
+    # print(
+    #     f"Final Evaluation Metrics at threshold {config['evaluation']['decision_threshold']}:"
+    # )
+    # print(f"Accuracy:  {accuracy:.4f}")
+    # print(f"Precision: {precision:.4f}")
+    # print(f"Recall:    {recall:.4f}")
+    # print(f"F1 Score:  {f1:.4f}")
+    # print(f"Average Precision: {avg_precision:.4f}")
+    # print(f"Percent to review for 95% recall: {percent_to_review:.2f}%")
+    # if reason_preds:
+    #     reason_macro_f1 = f1_score(
+    #         reason_labels, reason_preds, average="macro", zero_division=0
+    #     )
+    #     reason_cm = confusion_matrix(reason_labels, reason_preds)
+    #     print(f"Reason Macro-F1: {reason_macro_f1:.4f}")
+    #     print(
+    #         f"Reason per-class metrics:\n{classification_report(reason_labels, reason_preds, zero_division=0)}"
+    #     )
+    #     print(f"Reason Confusion Matrix:\n{reason_cm}")
 
     if save_false_preds:
         strong_fps = []

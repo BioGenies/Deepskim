@@ -17,7 +17,13 @@ from transformers import (
 )
 from peft import LoraConfig
 from trl import SFTTrainer, SFTConfig
-from sklearn.metrics import precision_score, recall_score, f1_score, average_precision_score, confusion_matrix
+from sklearn.metrics import (
+    precision_score,
+    recall_score,
+    f1_score,
+    average_precision_score,
+    confusion_matrix,
+)
 
 from .bert_model_building import compute_metrics
 from utils.evaluation import (
@@ -98,11 +104,16 @@ def compute_metrics(
         labels = labels_select.view(B, -1)
 
         explain_pred = pred[
-            :, -1
-        ]  # Selet only the last generated token (reason for exclusion or n if included)
-        explain_true = labels[
-            :, -1
-        ]  # Selet only the last generated token (reason for exclusion or n if included)
+            :, -3
+        ]  # 3rd-to-last token is the reason code digit (format: "reason : R <code> , yes/no")
+        explain_true = labels[:, -3]  # 3rd-to-last token is the reason code digit
+        n_token = 28711
+        ra_token = 28741
+        true_mask = (explain_true != n_token) & (explain_true != ra_token)
+        explain_true = explain_true[
+            true_mask
+        ]  # Discard placeholder ('n') and RA tokens
+        explain_pred = explain_pred[true_mask]
         explain_true_list.append(explain_true.numpy())
         explain_pred_list.append(explain_pred.numpy())
 
@@ -112,7 +123,9 @@ def compute_metrics(
         scores = np.concatenate(scores_list, 0)
         explain_true = np.concatenate(explain_true_list, 0)
         explain_pred = np.concatenate(explain_pred_list)
-        reason_macro_f1 = f1_score(explain_true, explain_pred, average="macro", zero_division=0)
+        reason_macro_f1 = f1_score(
+            explain_true, explain_pred, average="macro", zero_division=0
+        )
         reason_cm = confusion_matrix(explain_true, explain_pred)
         print(f"Reason macro-F1: {reason_macro_f1:.4f}")
         print(f"Reason confusion matrix:\n{reason_cm}")
@@ -203,8 +216,8 @@ class WeightedCESFTTrainer(SFTTrainer):
 class WeightedCEExplainSFTTrainer(SFTTrainer):
     def __init__(self, *args, positive_ratio: float = 0.3, **kwargs):
         super().__init__(*args, **kwargs)
-        self.lambda_decision = 2
-        self.lambda_reason = 1
+        self.lambda_decision = 1.5
+        self.lambda_reason = 1.0
         self.lambda_struct = 0.01
         self.positive_ratio = positive_ratio
         self._last_sub_losses: Dict[str, float] = {}
@@ -284,38 +297,62 @@ class WeightedCEExplainSFTTrainer(SFTTrainer):
         B, T, V = logits.shape  # Note shape change
 
         # Loss has two parts: yes/no classification (weighted) + reason selection
+        # Output format is now "reason: <code>, yes/no"
+        # So: decision token is LAST, reason code token is SECOND-TO-LAST
 
         # Inclusion decision: yes/no classification
         # Define weights: [Weight for Exclude (0), Weight for Include (1)]
         # We give the positive class a weight of ~11.5
-        # weights = torch.tensor([1.0, 11.5]).to(model.device)
-        weights = torch.ones((logits.shape[-1],), device=model.device)
-        weights[5081] = 11.5  # yes token
-        weights[708] = 1  # no token
-        # Flatten logits and labels for CrossEntropy
-        # loss_func_include = nn.CrossEntropyLoss(weight=weights) #TODO: Change to functional to avoid unnecessary
-        decision_logits = logits[
-            :, 0
-        ]  # Selet only the first generated token (inclusion/exclusion logit)
-        decision_labels = labels[:, 0]
+        weights_decision = torch.ones((logits.shape[-1],), device=model.device)
+        weights_decision[5081] = 11.5  # yes token
+        weights_decision[708] = 1  # no token
+        decision_logits = logits[:, -1]  # Last generated token is the yes/no decision
+        decision_labels = labels[:, -1]
         loss_include = F.cross_entropy(
-            decision_logits.view(B, V), decision_labels.view(-1), weight=weights
+            decision_logits.view(B, V),
+            decision_labels.view(-1),
+            weight=weights_decision,
         )
 
         # Reasoning decision: Select a decision for exclusion from the codebook
+        # Only computed on excluded (no) examples — includes have placeholder Rn (28711)
+        RN_TOKEN_ID = 28711  # placeholder token for included examples
         reason_logits = logits[
-            :, -1
-        ]  # Selet only the last generated token (reason for exclusion or n if included)
+            :, -3
+        ]  # 3rd-to-last token is the reason code digit (e.g. n, 0, 1...) — format is "reason : R <code> , yes/no"
         reason_labels = labels[
-            :, -1
-        ]  # Selet only the last generated token (reason for exclusion or n if included)
+            :, -3
+        ]  # 3rd-to-last label token is the reason code digit
 
-        loss_reason = F.cross_entropy(reason_logits.view(B, V), reason_labels.view(-1))
+        RA_TOKEN_ID = 28741
+        exclude_mask = (reason_labels != RN_TOKEN_ID) & (
+            reason_labels != RA_TOKEN_ID
+        )  # True for excluded examples with a specific reason
+        weights_reason = torch.ones((logits.shape[-1],), device=model.device)
+        # Inverse-frequency weights derived from validation class counts:
+        # R0: 21, R1: 35, R2: 14, R3: 44, R4: 135, RA: 24
+        # Scaled so R4 (majority) = 1.0
+        weights_reason[28734] = 6.4  # R0 (135/21)
+        weights_reason[28740] = 3.9  # R1 (135/35)
+        weights_reason[28750] = 9.6  # R2 (135/14)
+        weights_reason[28770] = 3.1  # R3 (135/44)
+        weights_reason[28781] = 1.0  # R4 majority class
+        # RA (28741) excluded from training — noisy label, handled via entropy at inference
 
-        # Add a small overall loss to enforce structure (middle tokens only, not decision/reason)
+        if exclude_mask.any():
+            loss_reason = F.cross_entropy(
+                reason_logits[exclude_mask].view(-1, V),
+                reason_labels[exclude_mask].view(-1),
+                weight=weights_reason,
+            )
+        else:
+            loss_reason = torch.tensor(0.0, device=model.device)
+
+        # Add a small overall loss to enforce structure (exclude reason and decision)
         if T > 2:
             loss_struct = F.cross_entropy(
-                logits[:, 1:-1, :].reshape(-1, V), labels[:, 1:-1].reshape(-1)
+                logits[:, [0, 1, 2, 4], :].reshape(-1, V),
+                labels[:, [0, 1, 2, 4]].reshape(-1),
             )
         else:
             loss_struct = torch.tensor(0.0, device=model.device)
