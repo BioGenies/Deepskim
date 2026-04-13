@@ -107,9 +107,9 @@ def compute_metrics(
         labels = labels_select.view(B, -1)
 
         explain_pred = pred[
-            :, -3
-        ]  # 3rd-to-last token is the reason code digit (format: "reason : R <code> , yes/no")
-        explain_true = labels[:, -3]  # 3rd-to-last token is the reason code digit
+            :, -1
+        ]  # Last token is the reason code digit (format: "yes/no , reason : R <code>")
+        explain_true = labels[:, -1]  # Last token is the reason code digit
         n_token = 28711
         ra_token = 28741
         true_mask = (explain_true != n_token) & (explain_true != ra_token)
@@ -236,6 +236,9 @@ class WeightedCEExplainSFTTrainer(SFTTrainer):
         EvalObj = namedtuple("EvalObj", ["predictions", "label_ids"])
 
         all_metrics = None
+        eval_loss_accum = {"loss_decision": 0.0, "loss_reason": 0.0, "loss_total": 0.0}
+        eval_loss_count = 0
+
         for idx, example in enumerate(tqdm(eval_ds, desc="AR eval")):
             prompt = example["prompt"]
             completion = example["completion"]
@@ -263,7 +266,7 @@ class WeightedCEExplainSFTTrainer(SFTTrainer):
                 )
 
             # Stack generated-token scores into [1, gen_len, vocab]
-            gen_logits = torch.stack(outputs.scores, dim=1).cpu()  # [1, gen_len, vocab]
+            gen_logits = torch.stack(outputs.scores, dim=1)  # [1, gen_len, vocab]
 
             # Build label token ids for the completion
             label_ids = tokenizer(
@@ -277,12 +280,56 @@ class WeightedCEExplainSFTTrainer(SFTTrainer):
             label_len = label_ids.shape[1]
             if gen_len < label_len:
                 # Pad logits with zeros (won't match any label, counted as wrong)
-                pad = torch.zeros(1, label_len - gen_len, gen_logits.shape[2])
+                pad = torch.zeros(
+                    1,
+                    label_len - gen_len,
+                    gen_logits.shape[2],
+                    device=gen_logits.device,
+                )
                 gen_logits = torch.cat([gen_logits, pad], dim=1)
             elif gen_len > label_len:
                 gen_logits = gen_logits[:, :label_len, :]
 
-            eval_obj = EvalObj(predictions=gen_logits, label_ids=label_ids)
+            # Compute per-example AR eval losses
+            label_ids_dev = label_ids.to(gen_logits.device)
+            V = gen_logits.shape[-1]
+
+            # Decision loss (first token = yes/no)
+            weights_decision = torch.ones(V, device=gen_logits.device)
+            weights_decision[5081] = 11.5  # yes
+            weights_decision[708] = 1.0  # no
+            loss_decision = F.cross_entropy(
+                gen_logits[:, 0, :], label_ids_dev[:, 0], weight=weights_decision
+            )
+
+            # Reason loss (last token = reason code)
+            RN_TOKEN_ID = 28711
+            RA_TOKEN_ID = 28741
+            reason_label = label_ids_dev[:, -1]
+            if (reason_label != RN_TOKEN_ID).all() and (
+                reason_label != RA_TOKEN_ID
+            ).all():
+                weights_reason = torch.ones(V, device=gen_logits.device)
+                weights_reason[28734] = 6.4  # R0
+                weights_reason[28740] = 3.9  # R1
+                weights_reason[28750] = 9.6  # R2
+                weights_reason[28770] = 3.1  # R3
+                weights_reason[28781] = 1.0  # R4
+                loss_reason = F.cross_entropy(
+                    gen_logits[:, -1, :], reason_label, weight=weights_reason
+                )
+            else:
+                loss_reason = torch.tensor(0.0, device=gen_logits.device)
+
+            loss_total = (
+                self.lambda_decision * loss_decision + self.lambda_reason * loss_reason
+            )
+            eval_loss_accum["loss_decision"] += loss_decision.item()
+            eval_loss_accum["loss_reason"] += loss_reason.item()
+            eval_loss_accum["loss_total"] += loss_total.item()
+            eval_loss_count += 1
+
+            eval_obj = EvalObj(predictions=gen_logits.cpu(), label_ids=label_ids)
             is_last = idx == len(eval_ds) - 1
             ret = compute_metrics(
                 eval_obj,
@@ -299,6 +346,17 @@ class WeightedCEExplainSFTTrainer(SFTTrainer):
 
         if all_metrics is None:
             all_metrics = {}
+
+        if eval_loss_count > 0:
+            all_metrics["ar_loss_decision"] = (
+                eval_loss_accum["loss_decision"] / eval_loss_count
+            )
+            all_metrics["ar_loss_reason"] = (
+                eval_loss_accum["loss_reason"] / eval_loss_count
+            )
+            all_metrics["ar_loss_total"] = (
+                eval_loss_accum["loss_total"] / eval_loss_count
+            )
 
         prefixed = {f"{metric_key_prefix}_{k}": v for k, v in all_metrics.items()}
         self.log(prefixed)
@@ -380,8 +438,8 @@ class WeightedCEExplainSFTTrainer(SFTTrainer):
         B, T, V = logits.shape  # Note shape change
 
         # Loss has two parts: yes/no classification (weighted) + reason selection
-        # Output format is now "reason: <code>, yes/no"
-        # So: decision token is LAST, reason code token is SECOND-TO-LAST
+        # Output format is now "yes/no, reason: <code>"
+        # So: decision token is FIRST, reason code token is LAST
 
         # Inclusion decision: yes/no classification
         # Define weights: [Weight for Exclude (0), Weight for Include (1)]
@@ -389,8 +447,8 @@ class WeightedCEExplainSFTTrainer(SFTTrainer):
         weights_decision = torch.ones((logits.shape[-1],), device=model.device)
         weights_decision[5081] = 11.5  # yes token
         weights_decision[708] = 1  # no token
-        decision_logits = logits[:, -1]  # Last generated token is the yes/no decision
-        decision_labels = labels[:, -1]
+        decision_logits = logits[:, 0]  # First generated token is the yes/no decision
+        decision_labels = labels[:, 0]
         loss_include = F.cross_entropy(
             decision_logits.view(B, V),
             decision_labels.view(-1),
@@ -401,11 +459,9 @@ class WeightedCEExplainSFTTrainer(SFTTrainer):
         # Only computed on excluded (no) examples — includes have placeholder Rn (28711)
         RN_TOKEN_ID = 28711  # placeholder token for included examples
         reason_logits = logits[
-            :, -3
-        ]  # 3rd-to-last token is the reason code digit (e.g. n, 0, 1...) — format is "reason : R <code> , yes/no"
-        reason_labels = labels[
-            :, -3
-        ]  # 3rd-to-last label token is the reason code digit
+            :, -1
+        ]  # Last token is the reason code digit (e.g. n, 0, 1...) — format is "yes/no , reason : R <code>"
+        reason_labels = labels[:, -1]  # Last label token is the reason code digit
 
         RA_TOKEN_ID = 28741
         exclude_mask = (reason_labels != RN_TOKEN_ID) & (
@@ -431,11 +487,11 @@ class WeightedCEExplainSFTTrainer(SFTTrainer):
         else:
             loss_reason = torch.tensor(0.0, device=model.device)
 
-        # Add a small overall loss to enforce structure (exclude reason and decision)
+        # Add a small overall loss to enforce structure (exclude decision and reason code)
         if T > 2:
             loss_struct = F.cross_entropy(
-                logits[:, [0, 1, 2, 4], :].reshape(-1, V),
-                labels[:, [0, 1, 2, 4]].reshape(-1),
+                logits[:, [1, 2, 3, 4], :].reshape(-1, V),
+                labels[:, [1, 2, 3, 4]].reshape(-1),
             )
         else:
             loss_struct = torch.tensor(0.0, device=model.device)
