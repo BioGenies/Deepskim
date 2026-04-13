@@ -60,34 +60,48 @@ def tokenize_fn_val(example, tokenizer):
     }
 
 
+def tokenize_fn_train(example, tokenizer, max_length=4096):
+    prompt = example["prompt"]
+    completion = example["completion"]
+
+    prompt_ids = tokenizer(prompt, add_special_tokens=True)["input_ids"]
+    completion_ids = tokenizer(completion, add_special_tokens=False)["input_ids"]
+
+    input_ids = prompt_ids + completion_ids
+
+    # Create labels (mask out the prompt, keep completion including EOS)
+    labels = [-100] * len(prompt_ids) + completion_ids
+
+    if completion_ids[-1] == tokenizer.eos_token_id:
+        labels[-1] = -100  # Mask out EOS token - not relevant for loss
+    attention_mask = [1] * len(input_ids)
+
+    return {"input_ids": input_ids, "labels": labels, "attention_mask": attention_mask}
+
+
 def evaluate_model(config, checkpoint_path=None, save_false_preds=False):
 
     # ---------- Load dataset ----------
     train, test = prepare_dataset(**config["data"])
     test = train["test"]  # Check that the training and evaluation are implemented okay
 
-    # ---------- Quantization ----------
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=config["model"]["load_in_4bit"],
-        bnb_4bit_quant_type=config["model"]["bnb_4bit_quant_type"],
-        bnb_4bit_compute_dtype=config["model"]["bnb_4bit_compute_dtype"],
-        bnb_4bit_use_double_quant=config["model"]["bnb_4bit_use_double_quant"],
-    )
-
     # ---------- Load tokenizer ----------
     global tokenizer
     tokenizer = AutoTokenizer.from_pretrained(config["model"]["model_name"])
     tokenizer.pad_token = tokenizer.eos_token
 
-    tokenized_test = test.map(lambda x: tokenize_fn_val(x, tokenizer), batched=False)
-    tokenized_test = tokenized_test.remove_columns(["labels"])
+    if config["evaluation"]["teacher_forcing"]:
+        tokenize_fn = tokenize_fn_train
+    else:
+        tokenize_fn = tokenize_fn_val
+    tokenized_test = test.map(lambda x: tokenize_fn(x, tokenizer), batched=False)
+    # tokenized_test = tokenized_test.remove_columns(["labels"])
     tokenized_test.set_format(
         type="torch"
     )  # , columns=["input_ids", "attention_mask"])
     from torch.utils.data import DataLoader
 
     # model = BioMistralInference(peft_checkpoint=checkpoint_path, bnb_config=bnb_config)
-
     # device = next(model.model.parameters()).device  # works for QLoRA / regular models
 
     loader = DataLoader(
@@ -123,29 +137,52 @@ def evaluate_model(config, checkpoint_path=None, save_false_preds=False):
             inputs.pop("completion")
             inputs.pop("prompt")
             inputs = {k: v.to("cuda") for k, v in inputs.items()}
-            with autocast("cuda", dtype=torch.bfloat16):
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=6,  # Expect yes/no + reason
-                    do_sample=False,
-                    temperature=0.0,
-                    eos_token_id=tokenizer.eos_token_id,
-                    pad_token_id=tokenizer.pad_token_id,
-                    return_dict_in_generate=True,
-                    output_scores=True,
+            if config["evaluation"]["teacher_forcing"]:
+                with autocast("cuda", dtype=torch.bfloat16):
+                    with torch.inference_mode():
+                        outputs = model(**inputs)
+                predictions = outputs.logits
+                compute_tuple = eval_obj(
+                    predictions=predictions.to(torch.float16), label_ids=ex["labels"]
                 )
-            predictions = torch.cat(outputs[1])
-            predictions = predictions.unsqueeze(0).to("cpu")
-            labels = tokenizer(ex["completion"], add_special_tokens=False)["input_ids"]
-            labels = torch.tensor(labels).unsqueeze(0)
-            compute_tuple = eval_obj(predictions=predictions, label_ids=labels)
+                shift = True
+
+            else:
+                with autocast("cuda", dtype=torch.bfloat16):
+                    outputs = model.generate(
+                        **inputs,
+                        max_new_tokens=6,  # Expect yes/no + reason
+                        do_sample=False,
+                        temperature=0.0,
+                        eos_token_id=tokenizer.eos_token_id,
+                        pad_token_id=tokenizer.pad_token_id,
+                        return_dict_in_generate=True,
+                        output_scores=True,
+                    )
+                predictions = torch.cat(outputs[1])
+                predictions = predictions.unsqueeze(0).to("cpu")
+                labels = tokenizer(ex["completion"], add_special_tokens=False)[
+                    "input_ids"
+                ]
+                labels = torch.tensor(labels).unsqueeze(0)
+                compute_tuple = eval_obj(predictions=predictions, label_ids=labels)
+                shift = False
+                input_length = inputs["input_ids"].shape[1]
+                generated_ids = outputs[0][..., input_length:]
+                generated_ids = generated_ids.squeeze()
+                generated_text = tokenizer.decode(
+                    generated_ids, skip_special_tokens=True
+                ).strip()
+                print(
+                    f"Generated response: {generated_text}, GT response: {ex['completion'][0]}"
+                )
             ret_metrics = idx == len(loader) - 1
             ret = compute_metrics(
                 compute_tuple,
                 compute_result=ret_metrics,
                 explainability=True,
                 tokenizer=tokenizer,
-                shift=False,
+                shift=shift,
             )
             if ret:
                 print(ret)

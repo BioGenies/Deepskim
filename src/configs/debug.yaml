@@ -4,14 +4,14 @@ wandb_project_name: "Amyloid-test"
 run_name: "debug"
 
 data:
-  train_file_path: "/home/damian/projects/Deepskim/dataset/train_data.csv"
-  val_file_path: "/home/damian/projects/Deepskim/dataset/val_data.csv"
-  test_file_path: "/home/damian/projects/Deepskim/dataset/test_data.csv"
+  train_file_path: "/home/damian/projects/Deepskim/dataset/data_abstract_only/train_data.csv"
+  val_file_path: "/home/damian/projects/Deepskim/dataset/data_abstract_only/val_data.csv"
+  test_file_path: "/home/damian/projects/Deepskim/dataset/data_abstract_only/test_data.csv"
   target: "labels"
   seed: 1
   eos_token: null
   max_abstract_len: 400
-  # positive_ratio: 0.5
+  positive_ratio: 0.3
 
 model:
   model_name: "BioMistral/BioMistral-7B"
@@ -54,7 +54,7 @@ peft:
       save_steps: 20
       save_total_limit: 30
       logging_steps: 5
-      eval_steps: 20
+      eval_steps: 1
       learning_rate: 0.0002
       weight_decay: 0.01
       fp16: False

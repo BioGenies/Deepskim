@@ -2,6 +2,7 @@ import os
 import random
 import logging
 from abc import ABC, abstractmethod
+from collections import namedtuple
 from typing import Any, Dict
 from functools import partial
 import numpy as np
@@ -10,6 +11,7 @@ from datasets import Dataset, DatasetDict
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.amp import autocast
 from torch.utils.data import WeightedRandomSampler
 from transformers import (
     AutoTokenizer,
@@ -24,6 +26,7 @@ from sklearn.metrics import (
     average_precision_score,
     confusion_matrix,
 )
+from tqdm import tqdm
 
 from .bert_model_building import compute_metrics
 from utils.evaluation import (
@@ -223,6 +226,86 @@ class WeightedCEExplainSFTTrainer(SFTTrainer):
         self._last_sub_losses: Dict[str, float] = {}
         self._eval_sub_loss_accum: Dict[str, float] = {}
         self._eval_sub_loss_count: int = 0
+
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        eval_ds = eval_dataset if eval_dataset is not None else self.eval_dataset
+        tokenizer = self.tokenizer
+
+        self.model.eval()
+        self.model.config.use_cache = True
+        EvalObj = namedtuple("EvalObj", ["predictions", "label_ids"])
+
+        all_metrics = None
+        for idx, example in enumerate(tqdm(eval_ds, desc="AR eval")):
+            prompt = example["prompt"]
+            completion = example["completion"]
+
+            prompt_ids = tokenizer(
+                prompt, add_special_tokens=True, return_tensors="pt"
+            )["input_ids"]
+            # Strip EOS if tokenizer appended it — we want the model to continue generating
+            if prompt_ids[0, -1] == tokenizer.eos_token_id:
+                prompt_ids = prompt_ids[:, :-1]
+            prompt_ids = prompt_ids.to(self.model.device)
+            attention_mask = torch.ones_like(prompt_ids)
+
+            with torch.inference_mode(), autocast("cuda", dtype=torch.bfloat16):
+                outputs = self.model.generate(
+                    input_ids=prompt_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=6,
+                    do_sample=False,
+                    temperature=1.0,
+                    eos_token_id=tokenizer.eos_token_id,
+                    pad_token_id=tokenizer.pad_token_id,
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                )
+
+            # Stack generated-token scores into [1, gen_len, vocab]
+            gen_logits = torch.stack(outputs.scores, dim=1).cpu()  # [1, gen_len, vocab]
+
+            # Build label token ids for the completion
+            label_ids = tokenizer(
+                completion, add_special_tokens=False, return_tensors="pt"
+            )[
+                "input_ids"
+            ]  # [1, comp_len]
+
+            # Align lengths: generation may stop early (EOS) or label may be shorter
+            gen_len = gen_logits.shape[1]
+            label_len = label_ids.shape[1]
+            if gen_len < label_len:
+                # Pad logits with zeros (won't match any label, counted as wrong)
+                pad = torch.zeros(1, label_len - gen_len, gen_logits.shape[2])
+                gen_logits = torch.cat([gen_logits, pad], dim=1)
+            elif gen_len > label_len:
+                gen_logits = gen_logits[:, :label_len, :]
+
+            eval_obj = EvalObj(predictions=gen_logits, label_ids=label_ids)
+            is_last = idx == len(eval_ds) - 1
+            ret = compute_metrics(
+                eval_obj,
+                compute_result=is_last,
+                explainability=True,
+                tokenizer=tokenizer,
+                shift=False,
+            )
+            if ret is not None:
+                all_metrics = ret
+
+        self.model.config.use_cache = False
+        self.model.train()
+
+        if all_metrics is None:
+            all_metrics = {}
+
+        prefixed = {f"{metric_key_prefix}_{k}": v for k, v in all_metrics.items()}
+        self.log(prefixed)
+        self.control = self.callback_handler.on_evaluate(
+            self.args, self.state, self.control, prefixed
+        )
+        return prefixed
 
     def log(self, logs: Dict[str, float], start_time: float = None) -> None:
         is_eval = any(k.startswith("eval_") for k in logs)
