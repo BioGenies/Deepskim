@@ -3,7 +3,7 @@ import random
 import logging
 from abc import ABC, abstractmethod
 from collections import namedtuple
-from typing import Any, Dict
+from typing import Any, Dict, Union
 from functools import partial
 import numpy as np
 
@@ -28,11 +28,12 @@ from sklearn.metrics import (
 )
 from tqdm import tqdm
 
-from .bert_model_building import compute_metrics
 from utils.evaluation import (
-    gather_yes_no_logprobs,
-    convert_scores_to_probs,
-    convert_probs_to_labels,
+    REASON_TOKEN_IDS,
+    REASON_ORDER,
+    REASON_IDS_ORDERED,
+    gather_reason_logprobs,
+    compute_inclusion_prob,
     percent_to_review_for_recall,
 )
 
@@ -41,114 +42,89 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
+RN_ID = REASON_TOKEN_IDS["Rn"]
 
 y_true_list = []
 y_pred_list = []
 scores_list = []
-explain_true_list = []
-explain_pred_list = []
+reason_true_list = []
+reason_pred_list = []
 
 
-def compute_metrics(
-    eval_preds, tokenizer, compute_result, shift=True, explainability=False
-):
-    global y_true_list, y_pred_list, scores_list, explain_true_list, explain_pred_list
-    # Compute include/exclude (yes/no) metrics only
-    logits = eval_preds.predictions  # [batch, seq_len,, vocab]
-    labels = eval_preds.label_ids  # [batch, seq_len]
+def compute_metrics(eval_preds, compute_result, shift=True):
+    """Compute decision and reason metrics from reason-code predictions.
 
-    scores = gather_yes_no_logprobs(logits, tokenizer)  # [batch, seq_len, 2]
-    scores = convert_scores_to_probs(
-        scores.view(-1, 2)
-    )  # [batch*seq_len, 2] -> [batch*seq_len]
-    scores = scores.view(labels.shape)  # [batch, seq_len]
-    preds = logits.argmax(-1)  # [batch, seq_len]
+    Each call accumulates one eval example. When compute_result=True,
+    aggregates everything and returns the final metrics dict.
+    """
+    global y_true_list, y_pred_list, scores_list, reason_true_list, reason_pred_list
+
+    logits = eval_preds.predictions  # [B, seq_len, vocab]  (torch, CPU)
+    labels = eval_preds.label_ids  # [B, seq_len]
+
+    if not isinstance(logits, torch.Tensor):
+        logits = torch.tensor(logits)
+    if not isinstance(labels, torch.Tensor):
+        labels = torch.tensor(labels)
+
+    preds = logits.argmax(-1)
 
     if shift:
         preds = preds[:, :-1]
-        scores = scores[:, :-1]
+        logits = logits[:, :-1, :]
         labels = labels[:, 1:]
 
-    preds = preds.cpu()
-    labels = labels.cpu()
+    # Last token position is the reason code digit
+    pred_last = preds[:, -1]  # [B]
+    label_last = labels[:, -1]  # [B]
+    logits_last = logits[:, -1, :]  # [B, V]
 
-    yes_id = tokenizer.encode("yes", add_special_tokens=False)[0]
-    no_id = tokenizer.encode("no", add_special_tokens=False)[0]
+    # Binary decision: Rn → include (1), else → exclude (0)
+    y_true = (label_last == RN_ID).numpy().astype(int)
+    y_pred = (pred_last == RN_ID).numpy().astype(int)
 
-    preds_flat = preds.reshape(-1)
-    labels_flat = labels.reshape(-1)
-    scores_flat = scores.reshape(-1)
-
-    mask = np.isin(labels_flat, [yes_id, no_id])
-    # print(f"last pred tokens: {preds[:,-10:]}")
-    # print(f"last label tokens: {labels[:,-10:]}")
-
-    if mask.sum() == 0:
-        return {"accuracy": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0}
-
-    y_true_tokens = labels_flat[mask]
-    y_pred_tokens = preds_flat[mask]
-    scores_flat = scores_flat[mask]
-    print(f"Predicted: {y_pred_tokens}, True: {y_true_tokens}")
-
-    y_true = (y_true_tokens == yes_id).numpy().astype(int)
-    y_pred = (y_pred_tokens == yes_id).numpy().astype(int)
+    # Ranking: P(Rn) from softmax over 7 reason logits
+    reason_logits = gather_reason_logprobs(logits_last)  # [B, 7]
+    p_rn = compute_inclusion_prob(reason_logits)  # [B]
 
     y_true_list.append(y_true)
     y_pred_list.append(y_pred)
-    scores_list.append(scores_flat.cpu().numpy())
-
-    if explainability:
-
-        B, T, V = logits.shape
-        pred_select = preds_flat[labels_flat != -100]
-        pred = pred_select.view(B, -1)
-        labels_select = labels_flat[labels_flat != -100]
-        labels = labels_select.view(B, -1)
-
-        explain_pred = pred[
-            :, -1
-        ]  # Last token is the reason code digit (format: "yes/no , reason : R <code>")
-        explain_true = labels[:, -1]  # Last token is the reason code digit
-        n_token = 28711
-        ra_token = 28741
-        true_mask = (explain_true != n_token) & (explain_true != ra_token)
-        explain_true = explain_true[
-            true_mask
-        ]  # Discard placeholder ('n') and RA tokens
-        explain_pred = explain_pred[true_mask]
-        explain_true_list.append(explain_true.numpy())
-        explain_pred_list.append(explain_pred.numpy())
+    scores_list.append(p_rn.numpy())
+    reason_true_list.append(label_last.numpy())
+    reason_pred_list.append(pred_last.numpy())
 
     if compute_result:
-        y_true = np.concatenate(y_true_list, 0)
-        y_pred = np.concatenate(y_pred_list, 0)
-        scores = np.concatenate(scores_list, 0)
-        explain_true = np.concatenate(explain_true_list, 0)
-        explain_pred = np.concatenate(explain_pred_list)
+        y_true_all = np.concatenate(y_true_list)
+        y_pred_all = np.concatenate(y_pred_list)
+        scores_all = np.concatenate(scores_list)
+        reason_true_all = np.concatenate(reason_true_list)
+        reason_pred_all = np.concatenate(reason_pred_list)
+
         reason_macro_f1 = f1_score(
-            explain_true, explain_pred, average="macro", zero_division=0
+            reason_true_all, reason_pred_all, average="macro", zero_division=0
         )
-        reason_cm = confusion_matrix(explain_true, explain_pred)
+        reason_cm = confusion_matrix(reason_true_all, reason_pred_all)
         print(f"Reason macro-F1: {reason_macro_f1:.4f}")
         print(f"Reason confusion matrix:\n{reason_cm}")
+
         metrics = {
-            "accuracy": float((y_pred == y_true).mean()),
-            "precision": precision_score(y_true, y_pred, zero_division=0),
-            "recall": recall_score(y_true, y_pred, zero_division=0),
-            "f1": f1_score(y_true, y_pred, zero_division=0),
+            "accuracy": float((y_pred_all == y_true_all).mean()),
+            "precision": precision_score(y_true_all, y_pred_all, zero_division=0),
+            "recall": recall_score(y_true_all, y_pred_all, zero_division=0),
+            "f1": f1_score(y_true_all, y_pred_all, zero_division=0),
             "% to review for 95% recall": percent_to_review_for_recall(
-                list(zip(y_pred, scores)), y_true, recall_target=0.95
+                list(zip(y_pred_all, scores_all)), y_true_all, recall_target=0.95
             ),
-            "average_precision": average_precision_score(y_true, scores),
-            "explain_accuracy": float((explain_pred == explain_true).mean()),
+            "average_precision": average_precision_score(y_true_all, scores_all),
+            "reason_accuracy": float((reason_pred_all == reason_true_all).mean()),
             "reason_macro_f1": reason_macro_f1,
         }
+
         y_true_list = []
         y_pred_list = []
         scores_list = []
-        explain_true_list = []
-        explain_pred_list = []
+        reason_true_list = []
+        reason_pred_list = []
         return metrics
 
 
@@ -157,23 +133,21 @@ class QLora:
         self,
         model: AutoModelForSequenceClassification,
         tokenizer: AutoTokenizer,
-        # num_labels: int,
         lora_config: Dict[str, Any],
         sft_config: Dict[str, Any],
         train_dataset: Dataset,
         device: torch.device = torch.device("cpu"),
         eval_dataset: Dataset = None,
         positive_ratio: float = 0.3,
+        label_smoothing: float = 0.1,
+        continue_from: Union[str, None] = None,
     ):
         self.model = model
-        # self.num_labels = num_labels
         self.device = device
         self.lora_config = LoraConfig(**lora_config)
         self.sft_config = SFTConfig(**sft_config)
-        compute_metrics_func = partial(
-            compute_metrics, tokenizer=tokenizer, explainability=True
-        )
-        self.trainer = WeightedCEExplainSFTTrainer(
+        compute_metrics_func = partial(compute_metrics)
+        self.trainer = ReasonCodeSFTTrainer(
             self.model,
             train_dataset=train_dataset,
             compute_metrics=compute_metrics_func,
@@ -181,11 +155,365 @@ class QLora:
             peft_config=self.lora_config,
             eval_dataset=eval_dataset,
             positive_ratio=positive_ratio,
+            label_smoothing=label_smoothing,
         )
+        self.continue_from = continue_from
 
     def train_model(self):
         assert self.trainer.train_dataset is not None, "Train dataset not set."
-        self.trainer.train()
+        if self.continue_from is not None:
+            print(f"Resuming training from checkpoint: {self.continue_from}")
+        self.trainer.train(self.continue_from)
+
+
+class ReasonCodeSFTTrainer(SFTTrainer):
+    """SFT trainer for single-task reason code classification.
+
+    The model generates a reason code (R0-R4, RA, Rn) as the completion.
+    Decision (yes/no) is derived from the reason code at inference time:
+    Rn → include, everything else → exclude.
+    """
+
+    # Inverse-frequency weights for exclusion reasons only (R4 majority = 1.0)
+    # Used in the conditional 6-class reason loss (excluded examples only)
+    EXCL_REASON_ORDER = ["R0", "R1", "R2", "R3", "R4", "RA"]
+    EXCL_REASON_IDS = [REASON_TOKEN_IDS[k] for k in EXCL_REASON_ORDER]
+    EXCL_WEIGHTS = [6.4, 3.9, 9.6, 3.1, 1.0, 1.0]  # R0, R1, R2, R3, R4, RA
+    LAMBDA_LOSSES = [
+        1.0,
+        1.0,
+        0.01,
+    ]  # Loss weights: binary/decision, reason, structural
+
+    def __init__(
+        self,
+        *args,
+        positive_ratio=0.3,
+        label_smoothing=0.1,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.positive_ratio = positive_ratio
+        self.label_smoothing = label_smoothing
+        self._sub_loss_accum = {}
+        self._sub_loss_count = 0
+        self._eval_sub_loss_accum = {}
+        self._eval_sub_loss_count = 0
+        # Training metrics accumulators
+        self._train_y_true = []
+        self._train_y_pred = []
+        self._train_scores = []
+        self._train_reason_true = []
+        self._train_reason_pred = []
+
+    def get_train_dataloader(self):
+        dataset = self.train_dataset
+        is_positive = [str(ex.get("completion", "")).strip() == "Rn" for ex in dataset]
+        n_pos = sum(is_positive)
+        n_neg = len(is_positive) - n_pos
+        if n_pos == 0 or n_neg == 0:
+            return super().get_train_dataloader()
+        r = self.positive_ratio
+        w_pos = r / n_pos
+        w_neg = (1.0 - r) / n_neg
+        weights = [w_pos if p else w_neg for p in is_positive]
+        sampler = WeightedRandomSampler(
+            weights, num_samples=len(weights), replacement=True
+        )
+        logging.info(
+            f"WeightedRandomSampler: {n_pos} positives (Rn), {n_neg} negatives, "
+            f"target positive_ratio={r:.2f}"
+        )
+        return torch.utils.data.DataLoader(
+            dataset,
+            batch_size=self._train_batch_size,
+            sampler=sampler,
+            collate_fn=self.data_collator,
+            drop_last=self.args.dataloader_drop_last,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+        )
+
+    def compute_loss(
+        self, model, inputs, return_outputs=False, num_items_in_batch=None
+    ):
+        labels = inputs.get("labels")
+        outputs = model(**inputs)
+        logits = outputs.get("logits")
+
+        # Standard causal LM shift
+        logits = logits[..., :-1, :].contiguous()
+        labels = labels[..., 1:].contiguous()
+
+        B, T, V = logits.shape
+        logits_flat = logits.view(-1, V)
+        labels_flat = labels.view(-1)
+
+        # Select supervised tokens only
+        mask = labels_flat != -100
+        logits_select = logits_flat[mask]
+        labels_select = labels_flat[mask]
+
+        logits_2d = logits_select.view(B, -1, V)
+        labels_2d = labels_select.view(B, -1)
+
+        # Classification target is the LAST completion token (the reason digit)
+        class_logits = logits_2d[:, -1, :]  # [B, V]
+        class_labels = labels_2d[:, -1]  # [B]
+
+        # ---- Part 1: Binary include/exclude loss (drives the ranking signal) ----
+        # Pool the 6 exclusion logits via logsumexp into a single "exclude" logit,
+        # then do 2-class CE against Rn. This keeps the ranking score (P(Rn))
+        # clean and unaffected by the inter-exclusion-reason competition.
+        reason_ids = torch.tensor(REASON_IDS_ORDERED, device=model.device)
+        reason_logits_7 = class_logits[:, reason_ids]  # [B, 7]  order: Rn, R0..RA
+        rn_logit = reason_logits_7[:, 0:1]  # [B, 1]
+        excl_logits = reason_logits_7[:, 1:]  # [B, 6]
+        excl_pooled = torch.logsumexp(excl_logits, dim=-1, keepdim=True)  # [B, 1]
+        binary_logits = torch.cat(
+            [excl_pooled.detach(), rn_logit], dim=-1
+        )  # [B, 2] = [excl, incl]
+        binary_target = (class_labels == RN_ID).long()  # [B], 1=include
+        POSITIVE_WEIGHT = 5
+        weights = torch.ones(binary_logits.shape[-1]).to(binary_logits.device)
+        weights[-1] = POSITIVE_WEIGHT
+        loss_binary = F.cross_entropy(
+            binary_logits,
+            binary_target,
+            label_smoothing=self.label_smoothing,
+            weight=weights,
+        )
+
+        # ---- Part 2: Conditional 6-class reason loss (excluded examples only) ----
+        # Optimizes the within-exclusion classification without touching the Rn logit.
+        excl_mask = class_labels != RN_ID
+        loss_reason = torch.tensor(0.0, device=model.device)
+        if excl_mask.any():
+            excl_ids = torch.tensor(self.EXCL_REASON_IDS, device=model.device)
+            excl_cls_logits = class_logits[excl_mask][:, excl_ids]  # [n_excl, 6]
+            excl_labels = class_labels[excl_mask]  # [n_excl]
+            # Map vocab token IDs → 0..5 index
+            excl_label_idx = torch.zeros_like(excl_labels)
+            for i, tid in enumerate(self.EXCL_REASON_IDS):
+                excl_label_idx[excl_labels == tid] = i
+            excl_weights = torch.tensor(
+                self.EXCL_WEIGHTS, dtype=torch.float, device=model.device
+            )
+            loss_reason = F.cross_entropy(
+                excl_cls_logits,
+                excl_label_idx,
+                weight=excl_weights,
+                label_smoothing=self.label_smoothing,
+            )
+
+        # ---- Part 3: Small structural loss on prefix tokens (the "R") ----
+        if logits_2d.shape[1] > 1:
+            struct_logits = logits_2d[:, :-1, :].reshape(-1, V)
+            struct_labels = labels_2d[:, :-1].reshape(-1)
+            loss_struct = F.cross_entropy(struct_logits, struct_labels)
+        else:
+            loss_struct = torch.tensor(0.0, device=model.device)
+
+        loss = (
+            self.LAMBDA_LOSSES[0] * loss_binary
+            + self.LAMBDA_LOSSES[1] * loss_reason
+            + self.LAMBDA_LOSSES[2] * loss_struct
+        )
+
+        sub = {
+            "loss_binary": loss_binary.detach().item(),
+            "loss_reason": loss_reason.detach().item(),
+            "loss_struct": loss_struct.detach().item(),
+        }
+        for k, v in sub.items():
+            self._sub_loss_accum[k] = self._sub_loss_accum.get(k, 0.0) + v
+        self._sub_loss_count += 1
+
+        # Accumulate training metrics from teacher-forced logits
+        with torch.no_grad():
+            y_true = (class_labels == RN_ID).cpu().numpy().astype(int)
+            y_pred = (binary_logits.argmax(-1) == 1).cpu().numpy().astype(int)
+            p_rn = compute_inclusion_prob(reason_logits_7).cpu().numpy()
+            self._train_y_true.append(y_true)
+            self._train_y_pred.append(y_pred)
+            self._train_scores.append(p_rn)
+            self._train_reason_true.append(class_labels.cpu().numpy())
+            self._train_reason_pred.append(class_logits.argmax(-1).cpu().numpy())
+
+        return (loss, outputs) if return_outputs else loss
+
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        eval_ds = eval_dataset if eval_dataset is not None else self.eval_dataset
+        tokenizer = self.tokenizer
+
+        self.model.eval()
+        self.model.config.use_cache = True
+        EvalObj = namedtuple("EvalObj", ["predictions", "label_ids"])
+
+        all_metrics = None
+        eval_loss_accum = {"binary": 0.0, "reason": 0.0}
+        eval_loss_count = 0
+
+        for idx, example in enumerate(tqdm(eval_ds, desc="AR eval")):
+            prompt = example["prompt"]
+            completion = example["completion"]
+
+            prompt_ids = tokenizer(
+                prompt, add_special_tokens=True, return_tensors="pt"
+            )["input_ids"]
+            if prompt_ids[0, -1] == tokenizer.eos_token_id:
+                prompt_ids = prompt_ids[:, :-1]
+            prompt_ids = prompt_ids.to(self.model.device)
+            attention_mask = torch.ones_like(prompt_ids)
+
+            with torch.inference_mode(), autocast("cuda", dtype=torch.bfloat16):
+                outputs = self.model.generate(
+                    input_ids=prompt_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=2,
+                    min_new_tokens=2,
+                    do_sample=False,
+                    temperature=1.0,
+                    eos_token_id=tokenizer.eos_token_id,
+                    pad_token_id=tokenizer.pad_token_id,
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                )
+                input_length = prompt_ids.shape[1]
+                generated_ids = outputs[0][..., input_length:]
+                generated_ids = generated_ids.squeeze()
+                generated_text = tokenizer.decode(
+                    generated_ids, skip_special_tokens=True
+                ).strip()
+                print(
+                    f"Generated val response: {generated_text}, GT response: {completion}"
+                )
+            gen_logits = torch.stack(outputs.scores, dim=1)  # [1, gen_len, vocab]
+
+            label_ids = tokenizer(
+                completion, add_special_tokens=False, return_tensors="pt"
+            )["input_ids"]
+
+            # Align lengths
+            gen_len = gen_logits.shape[1]
+            label_len = label_ids.shape[1]
+            if gen_len < label_len:
+                pad = torch.zeros(
+                    1,
+                    label_len - gen_len,
+                    gen_logits.shape[2],
+                    device=gen_logits.device,
+                )
+                gen_logits = torch.cat([gen_logits, pad], dim=1)
+            elif gen_len > label_len:
+                gen_logits = gen_logits[:, :label_len, :]
+
+            # Decomposed eval loss matching training: binary + conditional reason
+            label_ids_dev = label_ids.to(gen_logits.device)
+            last_logits = gen_logits[:, -1, :]  # [1, V]
+            last_label = label_ids_dev[:, -1]  # [1]
+
+            # Binary loss
+            reason_ids = torch.tensor(REASON_IDS_ORDERED, device=gen_logits.device)
+            reason_logits_7 = last_logits[:, reason_ids]  # [1, 7]
+            rn_logit = reason_logits_7[:, 0:1]  # [1, 1]
+            excl_logits_7 = reason_logits_7[:, 1:]  # [1, 6]
+            excl_pooled = torch.logsumexp(excl_logits_7, dim=-1, keepdim=True)
+            binary_logits = torch.cat([excl_pooled, rn_logit], dim=-1)
+            binary_target = (last_label == RN_ID).long()
+            eval_loss_binary = F.cross_entropy(binary_logits, binary_target)
+
+            # Conditional reason loss (excluded examples only)
+            eval_loss_reason = torch.tensor(0.0, device=gen_logits.device)
+            if (last_label != RN_ID).all():
+                excl_ids = torch.tensor(self.EXCL_REASON_IDS, device=gen_logits.device)
+                excl_cls_logits = last_logits[:, excl_ids]
+                excl_label_idx = torch.zeros_like(last_label)
+                for i, tid in enumerate(self.EXCL_REASON_IDS):
+                    excl_label_idx[last_label == tid] = i
+                excl_weights = torch.tensor(
+                    self.EXCL_WEIGHTS, dtype=torch.float, device=gen_logits.device
+                )
+                eval_loss_reason = F.cross_entropy(
+                    excl_cls_logits, excl_label_idx, weight=excl_weights
+                )
+
+            eval_loss_accum["binary"] += eval_loss_binary.item()
+            eval_loss_accum["reason"] += eval_loss_reason.item()
+            eval_loss_count += 1
+
+            eval_obj = EvalObj(predictions=gen_logits.cpu(), label_ids=label_ids)
+            is_last = idx == len(eval_ds) - 1
+            ret = compute_metrics(eval_obj, compute_result=is_last, shift=False)
+            if ret is not None:
+                all_metrics = ret
+
+        self.model.config.use_cache = False
+        self.model.train()
+
+        if all_metrics is None:
+            all_metrics = {}
+        if eval_loss_count > 0:
+            all_metrics["ar_loss_binary"] = eval_loss_accum["binary"] / eval_loss_count
+            all_metrics["ar_loss_reason"] = eval_loss_accum["reason"] / eval_loss_count
+            all_metrics["ar_loss_total"] = (
+                all_metrics["ar_loss_binary"] + all_metrics["ar_loss_reason"]
+            )
+
+        prefixed = {f"{metric_key_prefix}_{k}": v for k, v in all_metrics.items()}
+        self.log(prefixed)
+        self.control = self.callback_handler.on_evaluate(
+            self.args, self.state, self.control, prefixed
+        )
+        return prefixed
+
+    def log(self, logs, start_time=None):
+        is_eval = any(k.startswith("eval_") for k in logs)
+        if not is_eval and self._sub_loss_count > 0:
+            avg = {k: v / self._sub_loss_count for k, v in self._sub_loss_accum.items()}
+            logs.update(avg)
+            self._sub_loss_accum = {}
+            self._sub_loss_count = 0
+
+            # Compute and report training metrics
+            if self._train_y_true:
+                y_true_all = np.concatenate(self._train_y_true)
+                y_pred_all = np.concatenate(self._train_y_pred)
+                scores_all = np.concatenate(self._train_scores)
+                reason_true_all = np.concatenate(self._train_reason_true)
+                reason_pred_all = np.concatenate(self._train_reason_pred)
+
+                logs["train_accuracy"] = float((y_pred_all == y_true_all).mean())
+                logs["train_precision"] = precision_score(
+                    y_true_all, y_pred_all, zero_division=0
+                )
+                logs["train_recall"] = recall_score(
+                    y_true_all, y_pred_all, zero_division=0
+                )
+                logs["train_f1"] = f1_score(y_true_all, y_pred_all, zero_division=0)
+                logs["train_average_precision"] = average_precision_score(
+                    y_true_all, scores_all
+                )
+                logs["train_pct_review_95recall"] = percent_to_review_for_recall(
+                    list(zip(y_pred_all, scores_all)), y_true_all, recall_target=0.95
+                )
+                logs["train_reason_accuracy"] = float(
+                    (reason_pred_all == reason_true_all).mean()
+                )
+                logs["train_reason_macro_f1"] = f1_score(
+                    reason_true_all, reason_pred_all, average="macro", zero_division=0
+                )
+
+                self._train_y_true = []
+                self._train_y_pred = []
+                self._train_scores = []
+                self._train_reason_true = []
+                self._train_reason_pred = []
+
+        if start_time is not None:
+            super().log(logs, start_time=start_time)
+        else:
+            super().log(logs)
 
 
 class WeightedCESFTTrainer(SFTTrainer):
@@ -217,11 +545,32 @@ class WeightedCESFTTrainer(SFTTrainer):
 
 
 class WeightedCEExplainSFTTrainer(SFTTrainer):
-    def __init__(self, *args, positive_ratio: float = 0.3, **kwargs):
+    def __init__(
+        self,
+        *args,
+        positive_ratio: float = 0.3,
+        training_stage: int = 0,
+        lambda_decision_anchor: float = 1.0,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
-        self.lambda_decision = 1.5
-        self.lambda_reason = 1.0
-        self.lambda_struct = 0.01
+        # training_stage: 0 = joint (default, legacy behaviour)
+        #                 1 = decision-only (reason loss zeroed out)
+        #                 2 = reason-only  (decision loss zeroed out, LoRA merged from stage 1)
+        self.training_stage = training_stage
+        if training_stage == 1:
+            self.lambda_decision = 1.5
+            self.lambda_reason = 0.0
+            self.lambda_struct = 0.01
+        elif training_stage == 2:
+            self.lambda_decision = 0.0
+            self.lambda_reason = 1.0
+            self.lambda_struct = 0.0
+            self.lambda_decision_anchor = lambda_decision_anchor
+        else:
+            self.lambda_decision = 1.5
+            self.lambda_reason = 1.0
+            self.lambda_struct = 0.01
         self.positive_ratio = positive_ratio
         self._last_sub_losses: Dict[str, float] = {}
         self._eval_sub_loss_accum: Dict[str, float] = {}
@@ -429,6 +778,7 @@ class WeightedCEExplainSFTTrainer(SFTTrainer):
         B, T, V = logits.shape
         logits_flat = logits.view(-1, V)
         labels_flat = labels.view(-1)
+        labels_flat_orig = labels_flat  # keep for stage-2 anchor
 
         logits_select = logits_flat[labels_flat != -100]
         labels_select = labels_flat[labels_flat != -100]
@@ -495,16 +845,51 @@ class WeightedCEExplainSFTTrainer(SFTTrainer):
             )
         else:
             loss_struct = torch.tensor(0.0, device=model.device)
+
+        # Stage 2: decision anchor — KL-distill from the merged base model (LoRA disabled)
+        # to prevent the new LoRA from drifting the decision boundary
+        loss_anchor = torch.tensor(0.0, device=model.device)
+        if self.training_stage == 2:
+            YES_ID = 5081
+            NO_ID = 708
+            from peft import PeftModel as _PeftModel
+
+            if isinstance(model, _PeftModel):
+                # Get base model decision logits with LoRA disabled
+                model.disable_adapter_layers()
+                with torch.no_grad():
+                    base_outputs = model(**inputs)
+                model.enable_adapter_layers()
+                base_logits = base_outputs.logits[..., :-1, :].contiguous()
+                # Extract decision position from base logits
+                B_orig = base_logits.shape[0]
+                base_flat = base_logits.view(-1, base_logits.shape[-1])
+                base_select = base_flat[labels_flat_orig != -100]
+                base_decision = base_select.view(B_orig, -1, base_logits.shape[-1])[
+                    :, 0, :
+                ]
+                # 2-class logits: [no, yes]
+                base_2 = base_decision[:, [NO_ID, YES_ID]]
+                curr_2 = decision_logits[:, [NO_ID, YES_ID]]
+                # KL(base || current) — keep current close to base
+                loss_anchor = F.kl_div(
+                    F.log_softmax(curr_2, dim=-1),
+                    F.softmax(base_2, dim=-1),
+                    reduction="batchmean",
+                )
+
         loss = (
             self.lambda_decision * loss_include
             + self.lambda_reason * loss_reason
             + self.lambda_struct * loss_struct
+            + getattr(self, "lambda_decision_anchor", 0.0) * loss_anchor
         )
 
         sub_losses = {
             "loss_decision": loss_include.detach().item(),
             "loss_reason": loss_reason.detach().item(),
             "loss_struct": loss_struct.detach().item(),
+            "loss_anchor": loss_anchor.detach().item(),
         }
         self._last_sub_losses = sub_losses
         if not self.model.training:

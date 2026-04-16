@@ -1,8 +1,5 @@
-from copy import deepcopy
-
 import math
 import torch
-from torch.amp import autocast
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -10,7 +7,6 @@ from transformers import (
     set_seed,
 )
 from datasets import DatasetDict, Dataset, concatenate_datasets
-from peft import PeftModel
 
 from data.dataset_qlora import prepare_dataset
 from training.qlora import QLora
@@ -157,6 +153,7 @@ def train_model(config):
         quantization_config=bnb_config,
         use_cache=False,
     )
+
     tokenizer = AutoTokenizer.from_pretrained(config["model"]["model_name"])
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -180,6 +177,8 @@ def train_model(config):
         eval_dataset=val_dataset,
         device=device,
         positive_ratio=config["data"].get("positive_ratio", 0.3),
+        label_smoothing=config.get("label_smoothing", 0.1),
+        continue_from=config["model"]["continue_from"],
     )
 
     # ------- Build & train -------

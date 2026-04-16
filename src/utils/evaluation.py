@@ -1,4 +1,32 @@
 import torch
+import torch.nn.functional as F
+
+
+# Reason code token IDs (BioMistral tokenizer)
+REASON_TOKEN_IDS = {
+    'Rn': 28711, 'R0': 28734, 'R1': 28740,
+    'R2': 28750, 'R3': 28770, 'R4': 28781, 'RA': 28741,
+}
+REASON_ORDER = ['Rn', 'R0', 'R1', 'R2', 'R3', 'R4', 'RA']
+REASON_IDS_ORDERED = [REASON_TOKEN_IDS[k] for k in REASON_ORDER]
+
+
+def gather_reason_logprobs(logits):
+    """Extract logits for the 7 reason code tokens.
+
+    Args:
+        logits: [..., vocab_size] tensor
+    Returns:
+        [..., 7] tensor with logits for [Rn, R0, R1, R2, R3, R4, RA]
+    """
+    idx = torch.tensor(REASON_IDS_ORDERED, device=logits.device)
+    return logits[..., idx]
+
+
+def compute_inclusion_prob(reason_logits):
+    """Compute P(Rn) from 7-class reason logits. Rn is at index 0."""
+    probs = F.softmax(reason_logits.float(), dim=-1)
+    return probs[..., 0]
 
 
 def gather_yes_no_logprobs(logprobs, tokenizer):

@@ -6,7 +6,8 @@ from data.data_splitter import DataSplitter, TrainTestSplit
 from data.dataset_builder import TrainTestConverter, DataFrameConverter
 
 # from .prompts.prompt_filter import get_prompt
-from .prompts.Mar13_prompt import get_prompt
+# from .prompts.Mar13_prompt import get_prompt
+from .prompts.Apr14_prompt import get_prompt
 
 from datasets import Dataset, DatasetDict
 
@@ -39,31 +40,18 @@ def prepare_dataset(
     """
 
     def _create_completion(label, reason_to_exclude):
-        """Creates completion for the LLM consisting of include/exclude label and reason for exclusion.
-        If multiple reasons are given, the first reason (sorted alphabetically) is selected
+        """Creates a reason-code completion for the LLM.
+        Returns the reason code (e.g. 'R0', 'Rn') or None for invalid entries
+        (excluded papers with no reason given).
         """
+        if label == 1:
+            return "Rn"
         if type(reason_to_exclude) == str:
-            reason_to_exclude = reason_to_exclude.split(",")
-            reason_to_exclude = (
-                "Rn" if label == 1 else sorted(reason_to_exclude)[0].strip()
-            )
-            reason_to_exclude = exclusion_reason_map[reason_to_exclude]
-        else:
-            reason_to_exclude = "Rn"
-        return f"{label_map[label]}, reason: {reason_to_exclude}"
+            reasons = reason_to_exclude.split(",")
+            reason = sorted(reasons)[0].strip()
+            return exclusion_reason_map[reason]
+        return None  # Excluded but no reason — filter out
 
-    def _clean_no_reason(data_list):
-        """Cleans a list of data by removing negative entries where no reason for rejection was given"""
-        cleaned_data = []
-        for data in data_list:
-            completion = data["completion"]
-            if "Rn" in completion and "no" in completion:
-                continue
-            else:
-                cleaned_data.append(data)
-        return cleaned_data
-
-    label_map = {0: "no", 1: "yes"}
     exclusion_reason_map = {
         "There are no interactions described": "R0",
         "The interactor is not an Ab": "R1",
@@ -77,8 +65,6 @@ def prepare_dataset(
         "Unknown antibody type": "RA",
         "Other": "RA",
     }
-    if eos_token:
-        label_map = {k: v + eos_token for k, v in label_map.items()}
     train_df = pd.read_csv(train_file_path)
     val_df = pd.read_csv(val_file_path)
     test_df = pd.read_csv(test_file_path)
@@ -119,8 +105,8 @@ def prepare_dataset(
         for x, y in zip(val_df.to_dict(orient="records"), val_df[target])
     ]
 
-    train_dataset = Dataset.from_list(_clean_no_reason(train_dataset))
-    val_dataset = Dataset.from_list(_clean_no_reason(val_dataset))
+    train_dataset = Dataset.from_list([d for d in train_dataset if d["completion"] is not None])
+    val_dataset = Dataset.from_list([d for d in val_dataset if d["completion"] is not None])
 
     train_dataset = DatasetDict({"train": train_dataset, "test": val_dataset})
     logging.info(
@@ -140,7 +126,7 @@ def prepare_dataset(
         for x, y in zip(test_df.to_dict(orient="records"), test_df[target])
     ]
 
-    test_dataset = Dataset.from_list(_clean_no_reason(test_dataset))
+    test_dataset = Dataset.from_list([d for d in test_dataset if d["completion"] is not None])
     logging.info(f"Test dataset size: Test={len(test_df)}")
 
     return train_dataset, test_dataset
