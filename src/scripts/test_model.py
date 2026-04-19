@@ -83,7 +83,7 @@ def evaluate_model(config, checkpoint_path=None, save_false_preds=False):
 
     # ---------- Load dataset ----------
     train, test = prepare_dataset(**config["data"])
-    test = train["test"]  # Check that the training and evaluation are implemented okay
+    # test = train["test"]  # Check that the training and evaluation are implemented okay
 
     # ---------- Load tokenizer ----------
     global tokenizer
@@ -151,7 +151,8 @@ def evaluate_model(config, checkpoint_path=None, save_false_preds=False):
                 with autocast("cuda", dtype=torch.bfloat16):
                     outputs = model.generate(
                         **inputs,
-                        max_new_tokens=6,  # Expect yes/no + reason
+                        max_new_tokens=3,  # Expect yes/no + reason
+                        min_new_tokens=3,  # Expect yes/no + reason
                         do_sample=False,
                         temperature=0.0,
                         eos_token_id=tokenizer.eos_token_id,
@@ -164,7 +165,7 @@ def evaluate_model(config, checkpoint_path=None, save_false_preds=False):
                 labels = tokenizer(ex["completion"], add_special_tokens=False)[
                     "input_ids"
                 ]
-                labels = torch.tensor(labels).unsqueeze(0)
+                labels = torch.tensor(labels)
                 compute_tuple = eval_obj(predictions=predictions, label_ids=labels)
                 shift = False
                 input_length = inputs["input_ids"].shape[1]
@@ -180,8 +181,6 @@ def evaluate_model(config, checkpoint_path=None, save_false_preds=False):
             ret = compute_metrics(
                 compute_tuple,
                 compute_result=ret_metrics,
-                explainability=True,
-                tokenizer=tokenizer,
                 shift=shift,
             )
             if ret:

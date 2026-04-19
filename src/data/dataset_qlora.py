@@ -40,16 +40,16 @@ def prepare_dataset(
     """
 
     def _create_completion(label, reason_to_exclude):
-        """Creates a reason-code completion for the LLM.
-        Returns the reason code (e.g. 'R0', 'Rn') or None for invalid entries
-        (excluded papers with no reason given).
+        """Creates a decision + reason-code completion for the LLM.
+        Returns 'yes Rn' for included papers, 'no <code>' for excluded,
+        or None for invalid entries (excluded papers with no reason given).
         """
         if label == 1:
-            return "Rn"
+            return "yes Rn"
         if type(reason_to_exclude) == str:
             reasons = reason_to_exclude.split(",")
             reason = sorted(reasons)[0].strip()
-            return exclusion_reason_map[reason]
+            return f"no {exclusion_reason_map[reason]}"
         return None  # Excluded but no reason — filter out
 
     exclusion_reason_map = {

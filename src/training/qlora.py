@@ -32,6 +32,8 @@ from utils.evaluation import (
     REASON_TOKEN_IDS,
     REASON_ORDER,
     REASON_IDS_ORDERED,
+    YES_ID,
+    NO_ID,
     gather_reason_logprobs,
     compute_inclusion_prob,
     percent_to_review_for_recall,
@@ -42,8 +44,6 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-RN_ID = REASON_TOKEN_IDS["Rn"]
-
 y_true_list = []
 y_pred_list = []
 scores_list = []
@@ -52,7 +52,7 @@ reason_pred_list = []
 
 
 def compute_metrics(eval_preds, compute_result, shift=True):
-    """Compute decision and reason metrics from reason-code predictions.
+    """Compute decision and reason metrics from 3-token predictions (decision + reason).
 
     Each call accumulates one eval example. When compute_result=True,
     aggregates everything and returns the final metrics dict.
@@ -74,24 +74,31 @@ def compute_metrics(eval_preds, compute_result, shift=True):
         logits = logits[:, :-1, :]
         labels = labels[:, 1:]
 
-    # Last token position is the reason code digit
+    # First token: decision (yes/no), last token: reason digit
+    pred_first = preds[:, 0]  # [B]
+    label_first = labels[:, 0]  # [B]
+    logits_first = logits[:, 0, :]  # [B, V]
+
     pred_last = preds[:, -1]  # [B]
     label_last = labels[:, -1]  # [B]
-    logits_last = logits[:, -1, :]  # [B, V]
 
-    # Binary decision: Rn → include (1), else → exclude (0)
-    y_true = (label_last == RN_ID).numpy().astype(int)
-    y_pred = (pred_last == RN_ID).numpy().astype(int)
+    # Binary decision from yes/no token
+    y_true = (label_first == YES_ID).numpy().astype(int)
+    y_pred = (pred_first == YES_ID).numpy().astype(int)
 
-    # Ranking: P(Rn) from softmax over 7 reason logits
-    reason_logits = gather_reason_logprobs(logits_last)  # [B, 7]
-    p_rn = compute_inclusion_prob(reason_logits)  # [B]
+    # Ranking: P(yes) from 2-class softmax
+    yes_no_logits = logits_first[:, [NO_ID, YES_ID]]  # [B, 2]
+    p_yes = F.softmax(yes_no_logits.float(), dim=-1)[:, 1]  # [B]
 
     y_true_list.append(y_true)
     y_pred_list.append(y_pred)
-    scores_list.append(p_rn.numpy())
-    reason_true_list.append(label_last.numpy())
-    reason_pred_list.append(pred_last.numpy())
+    scores_list.append(p_yes.numpy())
+    mask_rn = label_last != REASON_TOKEN_IDS["Rn"]
+    label_last = label_last[mask_rn]
+    pred_last = pred_last[mask_rn]
+    if pred_last.numel() > 0:
+        reason_true_list.append(label_last.numpy())
+        reason_pred_list.append(pred_last.numpy())
 
     if compute_result:
         y_true_all = np.concatenate(y_true_list)
@@ -103,7 +110,19 @@ def compute_metrics(eval_preds, compute_result, shift=True):
         reason_macro_f1 = f1_score(
             reason_true_all, reason_pred_all, average="macro", zero_division=0
         )
-        reason_cm = confusion_matrix(reason_true_all, reason_pred_all)
+        reason_cm = confusion_matrix(
+            reason_true_all,
+            reason_pred_all,
+            labels=[
+                REASON_TOKEN_IDS["R0"],
+                REASON_TOKEN_IDS["R1"],
+                REASON_TOKEN_IDS["R2"],
+                REASON_TOKEN_IDS["R3"],
+                REASON_TOKEN_IDS["R4"],
+                REASON_TOKEN_IDS["RA"],
+                REASON_TOKEN_IDS["Rn"],
+            ],
+        )
         print(f"Reason macro-F1: {reason_macro_f1:.4f}")
         print(f"Reason confusion matrix:\n{reason_cm}")
 
@@ -139,7 +158,7 @@ class QLora:
         device: torch.device = torch.device("cpu"),
         eval_dataset: Dataset = None,
         positive_ratio: float = 0.3,
-        label_smoothing: float = 0.1,
+        label_smoothing: float = 0.03,
         continue_from: Union[str, None] = None,
     ):
         self.model = model
@@ -167,29 +186,29 @@ class QLora:
 
 
 class ReasonCodeSFTTrainer(SFTTrainer):
-    """SFT trainer for single-task reason code classification.
+    """SFT trainer for decision + reason code classification.
 
-    The model generates a reason code (R0-R4, RA, Rn) as the completion.
-    Decision (yes/no) is derived from the reason code at inference time:
-    Rn → include, everything else → exclude.
+    The model generates 3 tokens: decision (yes/no) + reason code (R0-R4, RA, Rn).
+    Format: "no R1", "yes Rn", etc.
     """
 
-    # Inverse-frequency weights for exclusion reasons only (R4 majority = 1.0)
-    # Used in the conditional 6-class reason loss (excluded examples only)
+    # sqrt of inverse-frequency ratios (R4 majority = 1.0) — gentler than
+    # raw inverse-frequency, which was over-predicting the rarest class (R2)
     EXCL_REASON_ORDER = ["R0", "R1", "R2", "R3", "R4", "RA"]
     EXCL_REASON_IDS = [REASON_TOKEN_IDS[k] for k in EXCL_REASON_ORDER]
-    EXCL_WEIGHTS = [6.4, 3.9, 9.6, 3.1, 1.0, 1.0]  # R0, R1, R2, R3, R4, RA
+    EXCL_WEIGHTS = [2.53, 1.97, 3.10, 1.76, 1.0, 1.0]  # R0, R1, R2, R3, R4, RA
+    POSITIVE_WEIGHT = 5
     LAMBDA_LOSSES = [
-        1.0,
+        0.2,
         1.0,
         0.01,
-    ]  # Loss weights: binary/decision, reason, structural
+    ]  # Loss weights: decision, reason, structural
 
     def __init__(
         self,
         *args,
         positive_ratio=0.3,
-        label_smoothing=0.1,
+        label_smoothing=0.03,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -208,7 +227,9 @@ class ReasonCodeSFTTrainer(SFTTrainer):
 
     def get_train_dataloader(self):
         dataset = self.train_dataset
-        is_positive = [str(ex.get("completion", "")).strip() == "Rn" for ex in dataset]
+        is_positive = [
+            str(ex.get("completion", "")).startswith("yes") for ex in dataset
+        ]
         n_pos = sum(is_positive)
         n_neg = len(is_positive) - n_pos
         if n_pos == 0 or n_neg == 0:
@@ -257,41 +278,29 @@ class ReasonCodeSFTTrainer(SFTTrainer):
         logits_2d = logits_select.view(B, -1, V)
         labels_2d = labels_select.view(B, -1)
 
-        # Classification target is the LAST completion token (the reason digit)
-        class_logits = logits_2d[:, -1, :]  # [B, V]
-        class_labels = labels_2d[:, -1]  # [B]
+        # Token positions: first = decision (yes/no), last = reason digit
+        decision_logits = logits_2d[:, 0, :]  # [B, V]
+        decision_labels = labels_2d[:, 0]  # [B]
+        reason_logits = logits_2d[:, -1, :]  # [B, V]
+        reason_labels = labels_2d[:, -1]  # [B]
 
-        # ---- Part 1: Binary include/exclude loss (drives the ranking signal) ----
-        # Pool the 6 exclusion logits via logsumexp into a single "exclude" logit,
-        # then do 2-class CE against Rn. This keeps the ranking score (P(Rn))
-        # clean and unaffected by the inter-exclusion-reason competition.
-        reason_ids = torch.tensor(REASON_IDS_ORDERED, device=model.device)
-        reason_logits_7 = class_logits[:, reason_ids]  # [B, 7]  order: Rn, R0..RA
-        rn_logit = reason_logits_7[:, 0:1]  # [B, 1]
-        excl_logits = reason_logits_7[:, 1:]  # [B, 6]
-        excl_pooled = torch.logsumexp(excl_logits, dim=-1, keepdim=True)  # [B, 1]
-        binary_logits = torch.cat(
-            [excl_pooled.detach(), rn_logit], dim=-1
-        )  # [B, 2] = [excl, incl]
-        binary_target = (class_labels == RN_ID).long()  # [B], 1=include
-        POSITIVE_WEIGHT = 5
-        weights = torch.ones(binary_logits.shape[-1]).to(binary_logits.device)
-        weights[-1] = POSITIVE_WEIGHT
-        loss_binary = F.cross_entropy(
-            binary_logits,
-            binary_target,
+        # ---- Part 1: Decision loss (yes/no, weighted) ----
+        weights_decision = torch.ones(V, device=model.device)
+        weights_decision[YES_ID] = self.POSITIVE_WEIGHT
+        loss_decision = F.cross_entropy(
+            decision_logits,
+            decision_labels,
+            weight=weights_decision,
             label_smoothing=self.label_smoothing,
-            weight=weights,
         )
 
         # ---- Part 2: Conditional 6-class reason loss (excluded examples only) ----
-        # Optimizes the within-exclusion classification without touching the Rn logit.
-        excl_mask = class_labels != RN_ID
+        excl_mask = decision_labels == NO_ID
         loss_reason = torch.tensor(0.0, device=model.device)
         if excl_mask.any():
             excl_ids = torch.tensor(self.EXCL_REASON_IDS, device=model.device)
-            excl_cls_logits = class_logits[excl_mask][:, excl_ids]  # [n_excl, 6]
-            excl_labels = class_labels[excl_mask]  # [n_excl]
+            excl_cls_logits = reason_logits[excl_mask][:, excl_ids]  # [n_excl, 6]
+            excl_labels = reason_labels[excl_mask]  # [n_excl]
             # Map vocab token IDs → 0..5 index
             excl_label_idx = torch.zeros_like(excl_labels)
             for i, tid in enumerate(self.EXCL_REASON_IDS):
@@ -306,22 +315,22 @@ class ReasonCodeSFTTrainer(SFTTrainer):
                 label_smoothing=self.label_smoothing,
             )
 
-        # ---- Part 3: Small structural loss on prefix tokens (the "R") ----
-        if logits_2d.shape[1] > 1:
-            struct_logits = logits_2d[:, :-1, :].reshape(-1, V)
-            struct_labels = labels_2d[:, :-1].reshape(-1)
+        # ---- Part 3: Structural loss on middle tokens (the " R" prefix) ----
+        if logits_2d.shape[1] > 2:
+            struct_logits = logits_2d[:, 1:-1, :].reshape(-1, V)
+            struct_labels = labels_2d[:, 1:-1].reshape(-1)
             loss_struct = F.cross_entropy(struct_logits, struct_labels)
         else:
             loss_struct = torch.tensor(0.0, device=model.device)
 
         loss = (
-            self.LAMBDA_LOSSES[0] * loss_binary
+            self.LAMBDA_LOSSES[0] * loss_decision
             + self.LAMBDA_LOSSES[1] * loss_reason
             + self.LAMBDA_LOSSES[2] * loss_struct
         )
 
         sub = {
-            "loss_binary": loss_binary.detach().item(),
+            "loss_decision": loss_decision.detach().item(),
             "loss_reason": loss_reason.detach().item(),
             "loss_struct": loss_struct.detach().item(),
         }
@@ -331,14 +340,15 @@ class ReasonCodeSFTTrainer(SFTTrainer):
 
         # Accumulate training metrics from teacher-forced logits
         with torch.no_grad():
-            y_true = (class_labels == RN_ID).cpu().numpy().astype(int)
-            y_pred = (binary_logits.argmax(-1) == 1).cpu().numpy().astype(int)
-            p_rn = compute_inclusion_prob(reason_logits_7).cpu().numpy()
+            y_true = (decision_labels == YES_ID).cpu().numpy().astype(int)
+            yes_no_logits = decision_logits[:, [NO_ID, YES_ID]]  # [B, 2]
+            y_pred = yes_no_logits.argmax(-1).cpu().numpy().astype(int)
+            p_yes = F.softmax(yes_no_logits.float(), dim=-1)[:, 1].cpu().numpy()
             self._train_y_true.append(y_true)
             self._train_y_pred.append(y_pred)
-            self._train_scores.append(p_rn)
-            self._train_reason_true.append(class_labels.cpu().numpy())
-            self._train_reason_pred.append(class_logits.argmax(-1).cpu().numpy())
+            self._train_scores.append(p_yes)
+            self._train_reason_true.append(reason_labels.cpu().numpy())
+            self._train_reason_pred.append(reason_logits.argmax(-1).cpu().numpy())
 
         return (loss, outputs) if return_outputs else loss
 
@@ -351,7 +361,7 @@ class ReasonCodeSFTTrainer(SFTTrainer):
         EvalObj = namedtuple("EvalObj", ["predictions", "label_ids"])
 
         all_metrics = None
-        eval_loss_accum = {"binary": 0.0, "reason": 0.0}
+        eval_loss_accum = {"decision": 0.0, "reason": 0.0}
         eval_loss_count = 0
 
         for idx, example in enumerate(tqdm(eval_ds, desc="AR eval")):
@@ -370,8 +380,8 @@ class ReasonCodeSFTTrainer(SFTTrainer):
                 outputs = self.model.generate(
                     input_ids=prompt_ids,
                     attention_mask=attention_mask,
-                    max_new_tokens=2,
-                    min_new_tokens=2,
+                    max_new_tokens=3,
+                    min_new_tokens=3,
                     do_sample=False,
                     temperature=1.0,
                     eos_token_id=tokenizer.eos_token_id,
@@ -408,24 +418,24 @@ class ReasonCodeSFTTrainer(SFTTrainer):
             elif gen_len > label_len:
                 gen_logits = gen_logits[:, :label_len, :]
 
-            # Decomposed eval loss matching training: binary + conditional reason
+            # Decomposed eval loss matching training: decision + conditional reason
             label_ids_dev = label_ids.to(gen_logits.device)
-            last_logits = gen_logits[:, -1, :]  # [1, V]
-            last_label = label_ids_dev[:, -1]  # [1]
+            V = gen_logits.shape[-1]
 
-            # Binary loss
-            reason_ids = torch.tensor(REASON_IDS_ORDERED, device=gen_logits.device)
-            reason_logits_7 = last_logits[:, reason_ids]  # [1, 7]
-            rn_logit = reason_logits_7[:, 0:1]  # [1, 1]
-            excl_logits_7 = reason_logits_7[:, 1:]  # [1, 6]
-            excl_pooled = torch.logsumexp(excl_logits_7, dim=-1, keepdim=True)
-            binary_logits = torch.cat([excl_pooled, rn_logit], dim=-1)
-            binary_target = (last_label == RN_ID).long()
-            eval_loss_binary = F.cross_entropy(binary_logits, binary_target)
+            # Decision loss (first token = yes/no)
+            first_logits = gen_logits[:, 0, :]  # [1, V]
+            first_label = label_ids_dev[:, 0]  # [1]
+            weights_decision = torch.ones(V, device=gen_logits.device)
+            weights_decision[YES_ID] = self.POSITIVE_WEIGHT
+            eval_loss_decision = F.cross_entropy(
+                first_logits, first_label, weight=weights_decision
+            )
 
             # Conditional reason loss (excluded examples only)
             eval_loss_reason = torch.tensor(0.0, device=gen_logits.device)
-            if (last_label != RN_ID).all():
+            if (first_label != YES_ID).all():
+                last_logits = gen_logits[:, -1, :]  # [1, V]
+                last_label = label_ids_dev[:, -1]  # [1]
                 excl_ids = torch.tensor(self.EXCL_REASON_IDS, device=gen_logits.device)
                 excl_cls_logits = last_logits[:, excl_ids]
                 excl_label_idx = torch.zeros_like(last_label)
@@ -438,7 +448,7 @@ class ReasonCodeSFTTrainer(SFTTrainer):
                     excl_cls_logits, excl_label_idx, weight=excl_weights
                 )
 
-            eval_loss_accum["binary"] += eval_loss_binary.item()
+            eval_loss_accum["decision"] += eval_loss_decision.item()
             eval_loss_accum["reason"] += eval_loss_reason.item()
             eval_loss_count += 1
 
@@ -454,10 +464,12 @@ class ReasonCodeSFTTrainer(SFTTrainer):
         if all_metrics is None:
             all_metrics = {}
         if eval_loss_count > 0:
-            all_metrics["ar_loss_binary"] = eval_loss_accum["binary"] / eval_loss_count
+            all_metrics["ar_loss_decision"] = (
+                eval_loss_accum["decision"] / eval_loss_count
+            )
             all_metrics["ar_loss_reason"] = eval_loss_accum["reason"] / eval_loss_count
             all_metrics["ar_loss_total"] = (
-                all_metrics["ar_loss_binary"] + all_metrics["ar_loss_reason"]
+                all_metrics["ar_loss_decision"] + all_metrics["ar_loss_reason"]
             )
 
         prefixed = {f"{metric_key_prefix}_{k}": v for k, v in all_metrics.items()}

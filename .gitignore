@@ -200,7 +200,7 @@ cython_debug/
 
 # Mac OS-specific storage files
 .DS_Store
-data/
+
 
 # Training logs
 bert_finetuned/

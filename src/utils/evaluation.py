@@ -10,6 +10,10 @@ REASON_TOKEN_IDS = {
 REASON_ORDER = ['Rn', 'R0', 'R1', 'R2', 'R3', 'R4', 'RA']
 REASON_IDS_ORDERED = [REASON_TOKEN_IDS[k] for k in REASON_ORDER]
 
+# Decision token IDs (BioMistral tokenizer)
+YES_ID = 5081
+NO_ID = 708
+
 
 def gather_reason_logprobs(logits):
     """Extract logits for the 7 reason code tokens.

@@ -177,7 +177,7 @@ def train_model(config):
         eval_dataset=val_dataset,
         device=device,
         positive_ratio=config["data"].get("positive_ratio", 0.3),
-        label_smoothing=config.get("label_smoothing", 0.1),
+        label_smoothing=config.get("label_smoothing", 0.03),
         continue_from=config["model"]["continue_from"],
     )
 

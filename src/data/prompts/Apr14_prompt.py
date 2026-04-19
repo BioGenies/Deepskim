@@ -11,14 +11,14 @@ RA — Other exclusion reason
 Rn — Meets all criteria: primary research; antibody modulates amyloid aggregation AND fibrillation measured by ThT/AFM/TEM/PET
 
 Decision rule:
-- If reason is Rn, the article should be INCLUDED
-- If reason is R0–RA, the article should be EXCLUDED
+- If the article should be INCLUDED, the reason is Rn
+- If the article should be EXCLUDED, the reason is R0–RA
 - Choose RA only if no other label fits.
 
 Output format:
-Respond with a single reason code. Examples:
-* "R0"
-* "Rn"
+Respond with a decision (yes/no) followed by the reason code. Examples:
+* "no R0"
+* "yes Rn"
 
 Input:
 Journal: {journal if journal else "Unknown"}
