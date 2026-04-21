@@ -36,6 +36,7 @@ from utils.evaluation import (
     convert_scores_to_probs,
     convert_probs_to_labels,
     percent_to_review_for_recall,
+    ReasonLogitBiasProcessor,
 )
 
 
@@ -83,7 +84,7 @@ def evaluate_model(config, checkpoint_path=None, save_false_preds=False):
 
     # ---------- Load dataset ----------
     train, test = prepare_dataset(**config["data"])
-    # test = train["test"]  # Check that the training and evaluation are implemented okay
+    test = train["test"]  # Check that the training and evaluation are implemented okay
 
     # ---------- Load tokenizer ----------
     global tokenizer
@@ -148,6 +149,10 @@ def evaluate_model(config, checkpoint_path=None, save_false_preds=False):
                 shift = True
 
             else:
+                r_prefix_id = int(
+                    tokenizer(" R", add_special_tokens=False)["input_ids"][-1]
+                )
+                bias_processor = ReasonLogitBiasProcessor(r_prefix_token_id=r_prefix_id)
                 with autocast("cuda", dtype=torch.bfloat16):
                     outputs = model.generate(
                         **inputs,
@@ -159,6 +164,7 @@ def evaluate_model(config, checkpoint_path=None, save_false_preds=False):
                         pad_token_id=tokenizer.pad_token_id,
                         return_dict_in_generate=True,
                         output_scores=True,
+                        logits_processor=[bias_processor],
                     )
                 predictions = torch.cat(outputs[1])
                 predictions = predictions.unsqueeze(0).to("cpu")

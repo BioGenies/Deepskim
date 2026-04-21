@@ -37,6 +37,8 @@ from utils.evaluation import (
     gather_reason_logprobs,
     compute_inclusion_prob,
     percent_to_review_for_recall,
+    apply_reason_logit_bias,
+    ReasonLogitBiasProcessor,
 )
 
 # ---------- Logging ----------
@@ -79,7 +81,9 @@ def compute_metrics(eval_preds, compute_result, shift=True):
     label_first = labels[:, 0]  # [B]
     logits_first = logits[:, 0, :]  # [B, V]
 
-    pred_last = preds[:, -1]  # [B]
+    # Bias-corrected argmax for the reason token — undoes the residual
+    # weighted-CE distortion that otherwise over-predicts high-weight classes
+    pred_last = apply_reason_logit_bias(logits[:, -1, :]).argmax(-1)  # [B]
     label_last = labels[:, -1]  # [B]
 
     # Binary decision from yes/no token
@@ -360,6 +364,12 @@ class ReasonCodeSFTTrainer(SFTTrainer):
         self.model.config.use_cache = True
         EvalObj = namedtuple("EvalObj", ["predictions", "label_ids"])
 
+        # Infer the " R" prefix token id (the token that immediately precedes
+        # the reason digit in the completion format) so the bias processor
+        # fires on exactly the reason step.
+        r_prefix_id = int(tokenizer(" R", add_special_tokens=False)["input_ids"][-1])
+        bias_processor = ReasonLogitBiasProcessor(r_prefix_token_id=r_prefix_id)
+
         all_metrics = None
         eval_loss_accum = {"decision": 0.0, "reason": 0.0}
         eval_loss_count = 0
@@ -388,6 +398,7 @@ class ReasonCodeSFTTrainer(SFTTrainer):
                     pad_token_id=tokenizer.pad_token_id,
                     return_dict_in_generate=True,
                     output_scores=True,
+                    logits_processor=[bias_processor],
                 )
                 input_length = prompt_ids.shape[1]
                 generated_ids = outputs[0][..., input_length:]

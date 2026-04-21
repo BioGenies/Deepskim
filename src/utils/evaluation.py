@@ -1,5 +1,7 @@
+import math
 import torch
 import torch.nn.functional as F
+from transformers import LogitsProcessor
 
 
 # Reason code token IDs (BioMistral tokenizer)
@@ -13,6 +15,55 @@ REASON_IDS_ORDERED = [REASON_TOKEN_IDS[k] for k in REASON_ORDER]
 # Decision token IDs (BioMistral tokenizer)
 YES_ID = 5081
 NO_ID = 708
+
+# Logit bias correction — undoes weighted-CE distortion at inference.
+# If training uses class weights w_c, the weighted CE optimum predicts
+# P̂(c) ∝ w_c · P(c). Subtracting log(w_c) from each class logit before
+# argmax restores P̂(c) ∝ P(c). Keep in sync with EXCL_WEIGHTS in qlora.py.
+REASON_TRAIN_WEIGHTS = {
+    'R0': 2.53, 'R1': 1.97, 'R2': 3.10, 'R3': 1.76, 'R4': 1.0, 'RA': 1.0,
+}
+REASON_LOGIT_BIAS = {
+    REASON_TOKEN_IDS[k]: -math.log(w) for k, w in REASON_TRAIN_WEIGHTS.items()
+}
+
+
+def apply_reason_logit_bias(logits):
+    """Subtract log(train_weight) from each reason-class logit.
+
+    Args:
+        logits: [..., vocab_size] tensor of raw logits.
+    Returns:
+        A new tensor with the bias applied at reason-token indices.
+    """
+    out = logits.clone()
+    for tid, bias in REASON_LOGIT_BIAS.items():
+        if bias != 0.0:
+            out[..., tid] = out[..., tid] + bias
+    return out
+
+
+class ReasonLogitBiasProcessor(LogitsProcessor):
+    """Apply reason-class bias correction on the final generation step.
+
+    Intended for the 3-token "decision + R + digit" generation format:
+    bias is applied only when the previously generated token is the
+    literal 'R' prefix, i.e. the next token is the reason digit.
+    """
+
+    def __init__(self, r_prefix_token_id: int):
+        self.r_prefix_token_id = int(r_prefix_token_id)
+        self._bias_ids = torch.tensor(list(REASON_LOGIT_BIAS.keys()))
+        self._bias_vals = torch.tensor(list(REASON_LOGIT_BIAS.values()))
+
+    def __call__(self, input_ids, scores):
+        mask = input_ids[:, -1] == self.r_prefix_token_id
+        if mask.any():
+            bias_ids = self._bias_ids.to(scores.device)
+            bias_vals = self._bias_vals.to(scores.device, dtype=scores.dtype)
+            row_idx = mask.nonzero(as_tuple=True)[0]
+            scores[row_idx[:, None], bias_ids] += bias_vals
+        return scores
 
 
 def gather_reason_logprobs(logits):
