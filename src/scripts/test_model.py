@@ -84,7 +84,7 @@ def evaluate_model(config, checkpoint_path=None, save_false_preds=False):
 
     # ---------- Load dataset ----------
     train, test = prepare_dataset(**config["data"])
-    test = train["test"]  # Check that the training and evaluation are implemented okay
+    # test = train["test"]  # Check that the training and evaluation are implemented okay
 
     # ---------- Load tokenizer ----------
     global tokenizer
@@ -164,7 +164,7 @@ def evaluate_model(config, checkpoint_path=None, save_false_preds=False):
                         pad_token_id=tokenizer.pad_token_id,
                         return_dict_in_generate=True,
                         output_scores=True,
-                        logits_processor=[bias_processor],
+                        # logits_processor=[bias_processor],
                     )
                 predictions = torch.cat(outputs[1])
                 predictions = predictions.unsqueeze(0).to("cpu")
@@ -274,37 +274,37 @@ def evaluate_model(config, checkpoint_path=None, save_false_preds=False):
     #     )
     #     print(f"Reason Confusion Matrix:\n{reason_cm}")
 
-    if save_false_preds:
-        strong_fps = []
-        strong_fns = []
-        for idx in range(len(labels)):
-            if labels[idx] == 1 and scores[idx] < 0.1:
-                strong_fns.append(idx)
-            elif labels[idx] == 0 and scores[idx] > 0.9:
-                strong_fps.append(idx)
+    # if save_false_preds:
+    #     strong_fps = []
+    #     strong_fns = []
+    #     for idx in range(len(labels)):
+    #         if labels[idx] == 1 and scores[idx] < 0.1:
+    #             strong_fns.append(idx)
+    #         elif labels[idx] == 0 and scores[idx] > 0.9:
+    #             strong_fps.append(idx)
 
-        header_row = ["Title", "Abstract", "Journal", "Referencess", "FP/FN"]
-        with open(
-            "strong_false_predictions.csv", mode="w", newline="", encoding="utf-8"
-        ) as file:
-            writer = csv.writer(file)
-            writer.writerow(header_row)
-            for idx, data in enumerate(loader.dataset):
-                if idx in strong_fns or idx in strong_fps:
-                    text = data["prompt"]
-                    title = re.search("Title: (.*)\n", text)
-                    abstract = re.search("Abstract: (.*)\n", text)
-                    journal = re.search("Journal: (.*)\n", text)
-                    refs = re.search("References: (.*)\n", text)
-                    false_type = "FN" if idx in strong_fns else "FP"
-                    row = [
-                        title.group(1),
-                        abstract.group(1),
-                        journal.group(1),
-                        refs.group(1) if refs else "",
-                        false_type,
-                    ]
-                    writer.writerow(row)
+    #     header_row = ["Title", "Abstract", "Journal", "Referencess", "FP/FN"]
+    #     with open(
+    #         "strong_false_predictions.csv", mode="w", newline="", encoding="utf-8"
+    #     ) as file:
+    #         writer = csv.writer(file)
+    #         writer.writerow(header_row)
+    #         for idx, data in enumerate(loader.dataset):
+    #             if idx in strong_fns or idx in strong_fps:
+    #                 text = data["prompt"]
+    #                 title = re.search("Title: (.*)\n", text)
+    #                 abstract = re.search("Abstract: (.*)\n", text)
+    #                 journal = re.search("Journal: (.*)\n", text)
+    #                 refs = re.search("References: (.*)\n", text)
+    #                 false_type = "FN" if idx in strong_fns else "FP"
+    #                 row = [
+    #                     title.group(1),
+    #                     abstract.group(1),
+    #                     journal.group(1),
+    #                     refs.group(1) if refs else "",
+    #                     false_type,
+    #                 ]
+    #                 writer.writerow(row)
 
 
 # Example usage

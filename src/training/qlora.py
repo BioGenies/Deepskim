@@ -123,7 +123,6 @@ def compute_metrics(eval_preds, compute_result, shift=True):
                 REASON_TOKEN_IDS["R2"],
                 REASON_TOKEN_IDS["R3"],
                 REASON_TOKEN_IDS["R4"],
-                REASON_TOKEN_IDS["RA"],
                 REASON_TOKEN_IDS["Rn"],
             ],
         )
@@ -192,15 +191,15 @@ class QLora:
 class ReasonCodeSFTTrainer(SFTTrainer):
     """SFT trainer for decision + reason code classification.
 
-    The model generates 3 tokens: decision (yes/no) + reason code (R0-R4, RA, Rn).
+    The model generates 3 tokens: decision (yes/no) + reason code (R0-R4, Rn).
     Format: "no R1", "yes Rn", etc.
     """
 
-    # sqrt of inverse-frequency ratios (R4 majority = 1.0) — gentler than
-    # raw inverse-frequency, which was over-predicting the rarest class (R2)
-    EXCL_REASON_ORDER = ["R0", "R1", "R2", "R3", "R4", "RA"]
+    # sqrt of inverse-frequency over post-cleanup train counts
+    # (R0=73, R1=141, R2=212, R3=116, R4=506), R4 majority = 1.0.
+    EXCL_REASON_ORDER = ["R0", "R1", "R2", "R3", "R4"]
     EXCL_REASON_IDS = [REASON_TOKEN_IDS[k] for k in EXCL_REASON_ORDER]
-    EXCL_WEIGHTS = [2.53, 1.97, 3.10, 1.76, 1.0, 1.0]  # R0, R1, R2, R3, R4, RA
+    EXCL_WEIGHTS = [2.63, 1.89, 1.54, 2.09, 1.0]  # R0, R1, R2, R3, R4
     POSITIVE_WEIGHT = 5
     LAMBDA_LOSSES = [
         0.2,
@@ -351,8 +350,15 @@ class ReasonCodeSFTTrainer(SFTTrainer):
             self._train_y_true.append(y_true)
             self._train_y_pred.append(y_pred)
             self._train_scores.append(p_yes)
-            self._train_reason_true.append(reason_labels.cpu().numpy())
-            self._train_reason_pred.append(reason_logits.argmax(-1).cpu().numpy())
+            # Mirror eval: score reason only on excluded examples (positives
+            # are untrained on Rn) and apply bias correction before argmax.
+            excl_mask_metric = decision_labels == NO_ID
+            if excl_mask_metric.any():
+                corrected = apply_reason_logit_bias(reason_logits[excl_mask_metric])
+                self._train_reason_true.append(
+                    reason_labels[excl_mask_metric].cpu().numpy()
+                )
+                self._train_reason_pred.append(corrected.argmax(-1).cpu().numpy())
 
         return (loss, outputs) if return_outputs else loss
 
@@ -503,8 +509,6 @@ class ReasonCodeSFTTrainer(SFTTrainer):
                 y_true_all = np.concatenate(self._train_y_true)
                 y_pred_all = np.concatenate(self._train_y_pred)
                 scores_all = np.concatenate(self._train_scores)
-                reason_true_all = np.concatenate(self._train_reason_true)
-                reason_pred_all = np.concatenate(self._train_reason_pred)
 
                 logs["train_accuracy"] = float((y_pred_all == y_true_all).mean())
                 logs["train_precision"] = precision_score(
@@ -520,12 +524,18 @@ class ReasonCodeSFTTrainer(SFTTrainer):
                 logs["train_pct_review_95recall"] = percent_to_review_for_recall(
                     list(zip(y_pred_all, scores_all)), y_true_all, recall_target=0.95
                 )
-                logs["train_reason_accuracy"] = float(
-                    (reason_pred_all == reason_true_all).mean()
-                )
-                logs["train_reason_macro_f1"] = f1_score(
-                    reason_true_all, reason_pred_all, average="macro", zero_division=0
-                )
+                if self._train_reason_true:
+                    reason_true_all = np.concatenate(self._train_reason_true)
+                    reason_pred_all = np.concatenate(self._train_reason_pred)
+                    logs["train_reason_accuracy"] = float(
+                        (reason_pred_all == reason_true_all).mean()
+                    )
+                    logs["train_reason_macro_f1"] = f1_score(
+                        reason_true_all,
+                        reason_pred_all,
+                        average="macro",
+                        zero_division=0,
+                    )
 
                 self._train_y_true = []
                 self._train_y_pred = []

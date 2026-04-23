@@ -7,9 +7,9 @@ from transformers import LogitsProcessor
 # Reason code token IDs (BioMistral tokenizer)
 REASON_TOKEN_IDS = {
     'Rn': 28711, 'R0': 28734, 'R1': 28740,
-    'R2': 28750, 'R3': 28770, 'R4': 28781, 'RA': 28741,
+    'R2': 28750, 'R3': 28770, 'R4': 28781,
 }
-REASON_ORDER = ['Rn', 'R0', 'R1', 'R2', 'R3', 'R4', 'RA']
+REASON_ORDER = ['Rn', 'R0', 'R1', 'R2', 'R3', 'R4']
 REASON_IDS_ORDERED = [REASON_TOKEN_IDS[k] for k in REASON_ORDER]
 
 # Decision token IDs (BioMistral tokenizer)
@@ -20,8 +20,9 @@ NO_ID = 708
 # If training uses class weights w_c, the weighted CE optimum predicts
 # P̂(c) ∝ w_c · P(c). Subtracting log(w_c) from each class logit before
 # argmax restores P̂(c) ∝ P(c). Keep in sync with EXCL_WEIGHTS in qlora.py.
+# sqrt(506/n_c) over post-cleanup train counts: R0=73, R1=141, R2=212, R3=116, R4=506.
 REASON_TRAIN_WEIGHTS = {
-    'R0': 2.53, 'R1': 1.97, 'R2': 3.10, 'R3': 1.76, 'R4': 1.0, 'RA': 1.0,
+    'R0': 2.63, 'R1': 1.89, 'R2': 1.54, 'R3': 2.09, 'R4': 1.0,
 }
 REASON_LOGIT_BIAS = {
     REASON_TOKEN_IDS[k]: -math.log(w) for k, w in REASON_TRAIN_WEIGHTS.items()
@@ -67,19 +68,19 @@ class ReasonLogitBiasProcessor(LogitsProcessor):
 
 
 def gather_reason_logprobs(logits):
-    """Extract logits for the 7 reason code tokens.
+    """Extract logits for the 6 reason code tokens.
 
     Args:
         logits: [..., vocab_size] tensor
     Returns:
-        [..., 7] tensor with logits for [Rn, R0, R1, R2, R3, R4, RA]
+        [..., 6] tensor with logits for [Rn, R0, R1, R2, R3, R4]
     """
     idx = torch.tensor(REASON_IDS_ORDERED, device=logits.device)
     return logits[..., idx]
 
 
 def compute_inclusion_prob(reason_logits):
-    """Compute P(Rn) from 7-class reason logits. Rn is at index 0."""
+    """Compute P(Rn) from 6-class reason logits. Rn is at index 0."""
     probs = F.softmax(reason_logits.float(), dim=-1)
     return probs[..., 0]
 

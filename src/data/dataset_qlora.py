@@ -7,7 +7,7 @@ from data.dataset_builder import TrainTestConverter, DataFrameConverter
 
 # from .prompts.prompt_filter import get_prompt
 # from .prompts.Mar13_prompt import get_prompt
-from .prompts.Apr14_prompt import get_prompt
+from .prompts.Apr21_prompt import get_prompt
 
 from datasets import Dataset, DatasetDict
 
@@ -42,28 +42,29 @@ def prepare_dataset(
     def _create_completion(label, reason_to_exclude):
         """Creates a decision + reason-code completion for the LLM.
         Returns 'yes Rn' for included papers, 'no <code>' for excluded,
-        or None for invalid entries (excluded papers with no reason given).
+        or None for rows to drop (no reason given, or reason not in the
+        kept content-based codebook — metadata filters and 'Other' are
+        excluded from training/eval upstream).
         """
         if label == 1:
             return "yes Rn"
         if type(reason_to_exclude) == str:
             reasons = reason_to_exclude.split(",")
             reason = sorted(reasons)[0].strip()
-            return f"no {exclusion_reason_map[reason]}"
-        return None  # Excluded but no reason — filter out
+            code = exclusion_reason_map.get(reason)
+            if code is None:
+                return None
+            return f"no {code}"
+        return None
 
     exclusion_reason_map = {
         "There are no interactions described": "R0",
         "The interactor is not an Ab": "R1",
         "Not enough experimental data": "R2",
-        "The interactee is not an amyloid protein": "R3",
-        "(Pre)Clinical trials. No interaction or amyloid data": "RA",
-        "Non-English paper": "RA",
         "In silico information only": "R2",
-        "Pre-print": "RA",
+        "(Pre)Clinical trials. No interaction or amyloid data": "R2",
+        "The interactee is not an amyloid protein": "R3",
         "Review article": "R4",
-        "Unknown antibody type": "RA",
-        "Other": "RA",
     }
     train_df = pd.read_csv(train_file_path)
     val_df = pd.read_csv(val_file_path)
