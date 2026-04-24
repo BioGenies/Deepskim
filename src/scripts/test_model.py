@@ -84,7 +84,7 @@ def evaluate_model(config, checkpoint_path=None, save_false_preds=False):
 
     # ---------- Load dataset ----------
     train, test = prepare_dataset(**config["data"])
-    # test = train["test"]  # Check that the training and evaluation are implemented okay
+    test = train["test"]  # Check that the training and evaluation are implemented okay
 
     # ---------- Load tokenizer ----------
     global tokenizer

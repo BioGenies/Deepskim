@@ -7,7 +7,7 @@ from data.dataset_builder import TrainTestConverter, DataFrameConverter
 
 # from .prompts.prompt_filter import get_prompt
 # from .prompts.Mar13_prompt import get_prompt
-from .prompts.Apr21_prompt import get_prompt
+from .prompts.Apr24_prompt import get_prompt
 
 from datasets import Dataset, DatasetDict
 
@@ -62,7 +62,6 @@ def prepare_dataset(
         "The interactor is not an Ab": "R1",
         "Not enough experimental data": "R2",
         "In silico information only": "R2",
-        "(Pre)Clinical trials. No interaction or amyloid data": "R2",
         "The interactee is not an amyloid protein": "R3",
         "Review article": "R4",
     }
@@ -106,8 +105,12 @@ def prepare_dataset(
         for x, y in zip(val_df.to_dict(orient="records"), val_df[target])
     ]
 
-    train_dataset = Dataset.from_list([d for d in train_dataset if d["completion"] is not None])
-    val_dataset = Dataset.from_list([d for d in val_dataset if d["completion"] is not None])
+    train_dataset = Dataset.from_list(
+        [d for d in train_dataset if d["completion"] is not None]
+    )
+    val_dataset = Dataset.from_list(
+        [d for d in val_dataset if d["completion"] is not None]
+    )
 
     train_dataset = DatasetDict({"train": train_dataset, "test": val_dataset})
     logging.info(
@@ -127,7 +130,9 @@ def prepare_dataset(
         for x, y in zip(test_df.to_dict(orient="records"), test_df[target])
     ]
 
-    test_dataset = Dataset.from_list([d for d in test_dataset if d["completion"] is not None])
+    test_dataset = Dataset.from_list(
+        [d for d in test_dataset if d["completion"] is not None]
+    )
     logging.info(f"Test dataset size: Test={len(test_df)}")
 
     return train_dataset, test_dataset
