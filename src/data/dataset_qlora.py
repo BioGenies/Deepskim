@@ -7,7 +7,8 @@ from data.dataset_builder import TrainTestConverter, DataFrameConverter
 
 # from .prompts.prompt_filter import get_prompt
 # from .prompts.Mar13_prompt import get_prompt
-from .prompts.Apr24_prompt import get_prompt
+from .prompts.Apr30_prompt import get_prompt
+from .exclusion_map import exclusion_reason_map
 
 from datasets import Dataset, DatasetDict
 
@@ -57,14 +58,6 @@ def prepare_dataset(
             return f"no {code}"
         return None
 
-    exclusion_reason_map = {
-        "There are no interactions described": "R0",
-        "The interactor is not an Ab": "R1",
-        "Not enough experimental data": "R2",
-        "In silico information only": "R2",
-        "The interactee is not an amyloid protein": "R3",
-        "Review article": "R4",
-    }
     train_df = pd.read_csv(train_file_path)
     val_df = pd.read_csv(val_file_path)
     test_df = pd.read_csv(test_file_path)

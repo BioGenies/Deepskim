@@ -25,6 +25,7 @@ from sklearn.metrics import (
     f1_score,
     average_precision_score,
     confusion_matrix,
+    precision_recall_fscore_support,
 )
 from tqdm import tqdm
 
@@ -51,6 +52,53 @@ y_pred_list = []
 scores_list = []
 reason_true_list = []
 reason_pred_list = []
+reason_gold_all_list = []  # gold reason per example (incl. Rn for positives)
+
+EXCL_REASON_KEYS = ["R0", "R1", "R2", "R3", "R4"]
+
+
+def _per_reason_classification_metrics(reason_true, reason_pred):
+    """Per-class precision/recall/F1/support over R0..R4."""
+    out = {}
+    label_ids = [REASON_TOKEN_IDS[k] for k in EXCL_REASON_KEYS]
+    p, r, f, s = precision_recall_fscore_support(
+        reason_true,
+        reason_pred,
+        labels=label_ids,
+        average=None,
+        zero_division=0,
+    )
+    for k, pk, rk, fk, sk in zip(EXCL_REASON_KEYS, p, r, f, s):
+        out[f"reason_precision_{k}"] = float(pk)
+        out[f"reason_recall_{k}"] = float(rk)
+        out[f"reason_f1_{k}"] = float(fk)
+        out[f"reason_support_{k}"] = int(sk)
+    return out
+
+
+def _stratified_ap_by_reason(y_true, scores, reason_gold):
+    """AP per gold reason class on {positives} ∪ {negatives with gold k}.
+
+    Diagnoses how well the decision head ranks positives above each
+    sub-population of negatives. Skips classes with no negatives present.
+    """
+    out = {}
+    pos_mask = y_true == 1
+    for k in EXCL_REASON_KEYS:
+        k_id = REASON_TOKEN_IDS[k]
+        mask = pos_mask | (reason_gold == k_id)
+        y = y_true[mask]
+        s = scores[mask]
+        if len(y) == 0 or y.sum() == 0 or y.sum() == len(y):
+            continue
+        ap = float(average_precision_score(y, s))
+        # No-skill baseline = positive prevalence in the conditional subset.
+        # Lift makes per-class APs comparable across strata with very different
+        # negative counts (and to overall AP, which has its own prevalence).
+        baseline = float(y.mean())
+        out[f"average_precision_{k}"] = ap
+        out[f"average_precision_lift_{k}"] = ap - baseline
+    return out
 
 
 def compute_metrics(eval_preds, compute_result, shift=True):
@@ -59,7 +107,7 @@ def compute_metrics(eval_preds, compute_result, shift=True):
     Each call accumulates one eval example. When compute_result=True,
     aggregates everything and returns the final metrics dict.
     """
-    global y_true_list, y_pred_list, scores_list, reason_true_list, reason_pred_list
+    global y_true_list, y_pred_list, scores_list, reason_true_list, reason_pred_list, reason_gold_all_list
 
     logits = eval_preds.predictions  # [B, seq_len, vocab]  (torch, CPU)
     labels = eval_preds.label_ids  # [B, seq_len]
@@ -97,12 +145,13 @@ def compute_metrics(eval_preds, compute_result, shift=True):
     y_true_list.append(y_true)
     y_pred_list.append(y_pred)
     scores_list.append(p_yes.numpy())
+    reason_gold_all_list.append(label_last.numpy())  # full vector, before Rn mask
     mask_rn = label_last != REASON_TOKEN_IDS["Rn"]
-    label_last = label_last[mask_rn]
-    pred_last = pred_last[mask_rn]
-    if pred_last.numel() > 0:
-        reason_true_list.append(label_last.numpy())
-        reason_pred_list.append(pred_last.numpy())
+    label_last_neg = label_last[mask_rn]
+    pred_last_neg = pred_last[mask_rn]
+    if pred_last_neg.numel() > 0:
+        reason_true_list.append(label_last_neg.numpy())
+        reason_pred_list.append(pred_last_neg.numpy())
 
     if compute_result:
         y_true_all = np.concatenate(y_true_list)
@@ -110,6 +159,7 @@ def compute_metrics(eval_preds, compute_result, shift=True):
         scores_all = np.concatenate(scores_list)
         reason_true_all = np.concatenate(reason_true_list)
         reason_pred_all = np.concatenate(reason_pred_list)
+        reason_gold_all = np.concatenate(reason_gold_all_list)
 
         reason_macro_f1 = f1_score(
             reason_true_all, reason_pred_all, average="macro", zero_division=0
@@ -141,12 +191,19 @@ def compute_metrics(eval_preds, compute_result, shift=True):
             "reason_accuracy": float((reason_pred_all == reason_true_all).mean()),
             "reason_macro_f1": reason_macro_f1,
         }
+        metrics.update(
+            _stratified_ap_by_reason(y_true_all, scores_all, reason_gold_all)
+        )
+        metrics.update(
+            _per_reason_classification_metrics(reason_true_all, reason_pred_all)
+        )
 
         y_true_list = []
         y_pred_list = []
         scores_list = []
         reason_true_list = []
         reason_pred_list = []
+        reason_gold_all_list = []
         return metrics
 
 
@@ -162,6 +219,7 @@ class QLora:
         eval_dataset: Dataset = None,
         positive_ratio: float = 0.3,
         label_smoothing: float = 0.03,
+        reason_weights: Union[Dict[str, float], None] = None,
         continue_from: Union[str, None] = None,
     ):
         self.model = model
@@ -178,6 +236,7 @@ class QLora:
             eval_dataset=eval_dataset,
             positive_ratio=positive_ratio,
             label_smoothing=label_smoothing,
+            reason_weights=reason_weights,
         )
         self.continue_from = continue_from
 
@@ -212,11 +271,13 @@ class ReasonCodeSFTTrainer(SFTTrainer):
         *args,
         positive_ratio=0.3,
         label_smoothing=0.03,
+        reason_weights: Union[Dict[str, float], None] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.positive_ratio = positive_ratio
         self.label_smoothing = label_smoothing
+        self.reason_weights = reason_weights
         self._sub_loss_accum = {}
         self._sub_loss_count = 0
         self._eval_sub_loss_accum = {}
@@ -227,26 +288,66 @@ class ReasonCodeSFTTrainer(SFTTrainer):
         self._train_scores = []
         self._train_reason_true = []
         self._train_reason_pred = []
+        self._train_reason_gold = []  # full gold reason per example, incl. Rn
 
     def get_train_dataloader(self):
         dataset = self.train_dataset
-        is_positive = [
-            str(ex.get("completion", "")).startswith("yes") for ex in dataset
-        ]
+
+        def _reason_of(ex):
+            comp = str(ex.get("completion", ""))
+            if comp.startswith("yes"):
+                return None
+            parts = comp.split()
+            return parts[-1] if parts else None
+
+        reasons = [_reason_of(ex) for ex in dataset]
+        is_positive = [r is None for r in reasons]
         n_pos = sum(is_positive)
         n_neg = len(is_positive) - n_pos
         if n_pos == 0 or n_neg == 0:
             return super().get_train_dataloader()
         r = self.positive_ratio
         w_pos = r / n_pos
-        w_neg = (1.0 - r) / n_neg
-        weights = [w_pos if p else w_neg for p in is_positive]
+
+        # Per-reason multipliers (default 1.0 → reproduces uniform per-example
+        # negative weighting, i.e. natural class frequency within negatives).
+        m = {k: 1.0 for k in self.EXCL_REASON_ORDER}
+        if self.reason_weights:
+            for k, v in self.reason_weights.items():
+                m[k] = float(v)
+
+        n_by_reason: Dict[str, int] = {}
+        for rk in reasons:
+            if rk is None:
+                continue
+            n_by_reason[rk] = n_by_reason.get(rk, 0) + 1
+
+        # Z normalises so that Σ over negatives of (m_k * (1-r) / Z) = 1 - r.
+        Z = sum(m.get(k, 1.0) * n for k, n in n_by_reason.items())
+        if Z <= 0:
+            return super().get_train_dataloader()
+
+        weights = []
+        for is_pos, rk in zip(is_positive, reasons):
+            if is_pos:
+                weights.append(w_pos)
+            else:
+                weights.append(m.get(rk, 1.0) * (1.0 - r) / Z)
+
         sampler = WeightedRandomSampler(
             weights, num_samples=len(weights), replacement=True
         )
+
+        # Realised conditional share P(reason=k | negative) in a sampled batch.
+        realised = {
+            k: m.get(k, 1.0) * n / Z for k, n in n_by_reason.items()
+        }
         logging.info(
             f"WeightedRandomSampler: {n_pos} positives (Rn), {n_neg} negatives, "
-            f"target positive_ratio={r:.2f}"
+            f"target positive_ratio={r:.2f}, "
+            f"reason counts={n_by_reason}, "
+            f"reason multipliers={m}, "
+            f"realised P(reason|neg)={ {k: round(v, 3) for k, v in realised.items()} }"
         )
         return torch.utils.data.DataLoader(
             dataset,
@@ -350,6 +451,7 @@ class ReasonCodeSFTTrainer(SFTTrainer):
             self._train_y_true.append(y_true)
             self._train_y_pred.append(y_pred)
             self._train_scores.append(p_yes)
+            self._train_reason_gold.append(reason_labels.cpu().numpy())
             # Mirror eval: score reason only on excluded examples (positives
             # are untrained on Rn) and apply bias correction before argmax.
             excl_mask_metric = decision_labels == NO_ID
@@ -524,6 +626,13 @@ class ReasonCodeSFTTrainer(SFTTrainer):
                 logs["train_pct_review_95recall"] = percent_to_review_for_recall(
                     list(zip(y_pred_all, scores_all)), y_true_all, recall_target=0.95
                 )
+                if self._train_reason_gold:
+                    reason_gold_all = np.concatenate(self._train_reason_gold)
+                    strat = _stratified_ap_by_reason(
+                        y_true_all, scores_all, reason_gold_all
+                    )
+                    for k, v in strat.items():
+                        logs[f"train_{k}"] = v
                 if self._train_reason_true:
                     reason_true_all = np.concatenate(self._train_reason_true)
                     reason_pred_all = np.concatenate(self._train_reason_pred)
@@ -536,12 +645,18 @@ class ReasonCodeSFTTrainer(SFTTrainer):
                         average="macro",
                         zero_division=0,
                     )
+                    per_class = _per_reason_classification_metrics(
+                        reason_true_all, reason_pred_all
+                    )
+                    for k, v in per_class.items():
+                        logs[f"train_{k}"] = v
 
                 self._train_y_true = []
                 self._train_y_pred = []
                 self._train_scores = []
                 self._train_reason_true = []
                 self._train_reason_pred = []
+                self._train_reason_gold = []
 
         if start_time is not None:
             super().log(logs, start_time=start_time)

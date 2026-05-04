@@ -178,6 +178,7 @@ def train_model(config):
         device=device,
         positive_ratio=config["data"].get("positive_ratio", 0.3),
         label_smoothing=config.get("label_smoothing", 0.03),
+        reason_weights=config["data"].get("reason_weights", None),
         continue_from=config["model"]["continue_from"],
     )
 

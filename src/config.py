@@ -11,3 +11,4 @@ PROCESSED_DIR = DATA_DIR / "processed"
 
 EMAIL = os.getenv("EMAIL")
 API_WANDB = os.getenv("API_WANDB")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
