@@ -289,6 +289,36 @@ class ReasonCodeSFTTrainer(SFTTrainer):
         self._train_reason_true = []
         self._train_reason_pred = []
         self._train_reason_gold = []  # full gold reason per example, incl. Rn
+        # --- timing probe: instruments the first N micro-batches only ---
+        self._probe_max_steps = 30
+        self._probe_step = 0
+        self._probe_fwd_ms = 0.0
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        if not torch.cuda.is_available() or self._probe_step >= self._probe_max_steps:
+            return super().training_step(model, inputs, num_items_in_batch)
+
+        ids = inputs.get("input_ids")
+        labels = inputs.get("labels")
+        B, T = (int(ids.shape[0]), int(ids.shape[1])) if ids is not None else (-1, -1)
+        n_sup = int((labels != -100).sum().item()) if labels is not None else -1
+
+        self._probe_fwd_ms = 0.0
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        loss = super().training_step(model, inputs, num_items_in_batch)
+        end.record()
+        torch.cuda.synchronize()
+        total_ms = start.elapsed_time(end)
+        bwd_ms = total_ms - self._probe_fwd_ms
+        self._probe_step += 1
+        logging.info(
+            f"[probe] microbatch {self._probe_step}/{self._probe_max_steps} "
+            f"B={B} T={T} sup_tokens={n_sup} tokens={B * T} | "
+            f"total={total_ms:.0f}ms fwd={self._probe_fwd_ms:.0f}ms bwd={bwd_ms:.0f}ms"
+        )
+        return loss
 
     def get_train_dataloader(self):
         dataset = self.train_dataset
@@ -339,9 +369,7 @@ class ReasonCodeSFTTrainer(SFTTrainer):
         )
 
         # Realised conditional share P(reason=k | negative) in a sampled batch.
-        realised = {
-            k: m.get(k, 1.0) * n / Z for k, n in n_by_reason.items()
-        }
+        realised = {k: m.get(k, 1.0) * n / Z for k, n in n_by_reason.items()}
         logging.info(
             f"WeightedRandomSampler: {n_pos} positives (Rn), {n_neg} negatives, "
             f"target positive_ratio={r:.2f}, "
@@ -363,7 +391,16 @@ class ReasonCodeSFTTrainer(SFTTrainer):
         self, model, inputs, return_outputs=False, num_items_in_batch=None
     ):
         labels = inputs.get("labels")
-        outputs = model(**inputs)
+        if torch.cuda.is_available() and self._probe_step < self._probe_max_steps:
+            _s = torch.cuda.Event(enable_timing=True)
+            _e = torch.cuda.Event(enable_timing=True)
+            _s.record()
+            outputs = model(**inputs)
+            _e.record()
+            torch.cuda.synchronize()
+            self._probe_fwd_ms = _s.elapsed_time(_e)
+        else:
+            outputs = model(**inputs)
         logits = outputs.get("logits")
 
         # Standard causal LM shift

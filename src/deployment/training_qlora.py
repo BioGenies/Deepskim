@@ -152,6 +152,7 @@ def train_model(config):
         device_map=config["model"]["device_map"],
         quantization_config=bnb_config,
         use_cache=False,
+        attn_implementation="flash_attention_2",
     )
 
     tokenizer = AutoTokenizer.from_pretrained(config["model"]["model_name"])
