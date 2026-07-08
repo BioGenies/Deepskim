@@ -95,7 +95,12 @@ def tokenize_fn_train(example, tokenizer, max_length=4096):
         labels[-1] = -100  # Mask out EOS token - not relevant for loss
     attention_mask = [1] * len(input_ids)
 
-    return {"input_ids": input_ids, "labels": labels, "attention_mask": attention_mask}
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "attention_mask": attention_mask,
+        "sufficiency": int(example.get("sufficiency", 0)),
+    }
 
 
 def tokenize_fn_val(example, tokenizer):
@@ -169,6 +174,7 @@ def train_model(config):
     # val_dataset = train_val['test'].map(lambda x: tokenize_fn_val(x, tokenizer), batched=False, remove_columns=['prompt', 'completion'])
     print(f"Model {config['model']['model_name']} loaded.")
     config["peft"]["sft_config"]["run_name"] = run_name
+    suff_cfg = config.get("sufficiency", {})
     qlora = QLora(
         model=model,
         tokenizer=tokenizer,
@@ -181,6 +187,12 @@ def train_model(config):
         label_smoothing=config.get("label_smoothing", 0.03),
         reason_weights=config["data"].get("reason_weights", None),
         continue_from=config["model"]["continue_from"],
+        lambda_suff=suff_cfg.get("lambda", 0.0),
+        suff_pos_weight=suff_cfg.get("pos_weight", None),
+        suff_dropout=suff_cfg.get("dropout", 0.0),
+        suff_pooling=suff_cfg.get("pooling", "mean"),
+        suff_detach=suff_cfg.get("detach", False),
+        suff_hidden_dim=suff_cfg.get("hidden_dim", None),
     )
 
     # ------- Build & train -------

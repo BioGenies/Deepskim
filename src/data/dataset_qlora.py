@@ -38,23 +38,62 @@ def prepare_dataset(
         Tuple of (train_dataset, test_dataset)
     """
 
-    def _create_completion(label, reason_to_exclude):
-        """Creates a decision + reason-code completion for the LLM.
-        Returns 'yes Rn' for included papers, 'no <code>' for excluded,
-        or None for rows to drop (no reason given, or reason not in the
-        kept content-based codebook — metadata filters and 'Other' are
-        excluded from training/eval upstream).
-        """
-        if label == 1:
-            return "yes Rn"
+    def _reason_code(reason_to_exclude):
+        """Map a free-text rejection reason to a single reason code (R0-R4), or None
+        (no reason, or a metadata/'Other' reason not in the content codebook)."""
         if type(reason_to_exclude) == str:
             reasons = reason_to_exclude.split(",")
             reason = sorted(reasons)[0].strip()
-            code = exclusion_reason_map.get(reason)
-            if code is None:
-                return None
-            return f"no {code}"
+            return exclusion_reason_map.get(reason)
         return None
+
+    def _build_target(label, reason_to_exclude):
+        """Return (completion, sufficiency) for one row, or None to drop it.
+
+        Handles both the legacy int labels (1/0) and the refined string labels
+        ('include'/'exclude'/'unclear'). sufficiency=1 marks an 'unclear' paper
+        (abstract insufficient to decide); it gets a placeholder leaning
+        completion whose decision/reason loss is masked downstream
+        (ReasonCodeSFTTrainer.compute_loss) — only the sufficiency head is
+        supervised on it. include/exclude rows are sufficiency=0.
+        """
+        lab = label.strip().lower() if isinstance(label, str) else label
+        if lab in ("unclear", "uncertain", "insufficient"):
+            # The decision/reason loss is MASKED for unclear rows (sufficiency==1);
+            # the completion is only a fixed-shape placeholder. Default to a valid
+            # code when the row carries no content reason so it always tokenizes to
+            # the 3-token "no R<x>" shape — a None here yields "no None" (2 tokens)
+            # and breaks the fixed-width reshape in ReasonCodeSFTTrainer.compute_loss.
+            code = _reason_code(reason_to_exclude) or "R2"
+            return f"no {code}", 1
+        if lab in (1, "1", "include", "yes"):
+            return "yes Rn", 0
+        # exclude / 0 / "no": needs a content-codebook reason or it is dropped
+        code = _reason_code(reason_to_exclude)
+        if code is None:
+            return None
+        return f"no {code}", 0
+
+    def _make_rows(df):
+        rows = []
+        for x, y in zip(df.to_dict(orient="records"), df[target]):
+            tgt = _build_target(y, x["If 0, reason to reject?"])
+            if tgt is None:
+                continue
+            completion, sufficiency = tgt
+            rows.append(
+                {
+                    "prompt": get_prompt(
+                        x["Title"],
+                        x["Abstract"],
+                        journal=x["Journal"],
+                        max_abstract_len=max_abstract_len,
+                    ),
+                    "completion": completion,
+                    "sufficiency": sufficiency,
+                }
+            )
+        return rows
 
     train_df = pd.read_csv(train_file_path)
     val_df = pd.read_csv(val_file_path)
@@ -70,60 +109,15 @@ def prepare_dataset(
     # train_dataset = Dataset.from_list(train_dataset)
     # val_dataset = Dataset.from_list(val_dataset)
 
-    train_dataset = [
-        {
-            "prompt": get_prompt(
-                x["Title"],
-                x["Abstract"],
-                journal=x["Journal"],
-                max_abstract_len=max_abstract_len,
-            ),
-            "completion": _create_completion(y, x["If 0, reason to reject?"]),
-        }
-        for x, y in zip(train_df.to_dict(orient="records"), train_df[target])
-    ]
-
-    val_dataset = [
-        {
-            "prompt": get_prompt(
-                x["Title"],
-                x["Abstract"],
-                journal=x["Journal"],
-                max_abstract_len=max_abstract_len,
-            ),
-            "completion": _create_completion(y, x["If 0, reason to reject?"]),
-        }
-        for x, y in zip(val_df.to_dict(orient="records"), val_df[target])
-    ]
-
-    train_dataset = Dataset.from_list(
-        [d for d in train_dataset if d["completion"] is not None]
-    )
-    val_dataset = Dataset.from_list(
-        [d for d in val_dataset if d["completion"] is not None]
-    )
+    train_dataset = Dataset.from_list(_make_rows(train_df))
+    val_dataset = Dataset.from_list(_make_rows(val_df))
 
     train_dataset = DatasetDict({"train": train_dataset, "test": val_dataset})
     logging.info(
         f"Train-val split: Train={len(train_dataset['train'])}, Val={len(train_dataset['test'])}"
     )
 
-    test_dataset = [
-        {
-            "prompt": get_prompt(
-                x["Title"],
-                x["Abstract"],
-                journal=x["Journal"],
-                max_abstract_len=max_abstract_len,
-            ),
-            "completion": _create_completion(y, x["If 0, reason to reject?"]),
-        }
-        for x, y in zip(test_df.to_dict(orient="records"), test_df[target])
-    ]
-
-    test_dataset = Dataset.from_list(
-        [d for d in test_dataset if d["completion"] is not None]
-    )
+    test_dataset = Dataset.from_list(_make_rows(test_df))
     logging.info(f"Test dataset size: Test={len(test_df)}")
 
     return train_dataset, test_dataset

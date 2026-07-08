@@ -100,6 +100,7 @@ class StratifiedKFoldByDecisionAndReason(SplitStrategy):
     """
 
     INCLUDED_KEY = "__INCLUDED__"
+    UNCLEAR_KEY = "__UNCLEAR__"
     RARE_KEY = "__RARE__"
 
     def __init__(
@@ -109,6 +110,7 @@ class StratifiedKFoldByDecisionAndReason(SplitStrategy):
         random_state: int = 42,
         reason_column: str = "If so; reason to reject?",
         included_value=1,
+        uncertain_value=None,
         invalid_target_values=("?", "-1"),
         verbose: bool = True,
     ):
@@ -117,6 +119,10 @@ class StratifiedKFoldByDecisionAndReason(SplitStrategy):
         self.random_state = random_state
         self.reason_column = reason_column
         self.included_value = included_value
+        # When set (e.g. "unclear"), rows of this class are kept regardless of
+        # reason and stratified as a single __UNCLEAR__ stratum (their reason is
+        # only provenance). None reproduces the binary include/exclude behaviour.
+        self.uncertain_value = uncertain_value
         self.invalid_target_values = set(str(v) for v in invalid_target_values)
         self.verbose = verbose
 
@@ -136,8 +142,14 @@ class StratifiedKFoldByDecisionAndReason(SplitStrategy):
             {"", *self.invalid_target_values}
         )
 
+        if self.uncertain_value is not None:
+            is_uncertain = df[target_column] == self.uncertain_value
+        else:
+            is_uncertain = pd.Series(False, index=df.index)
+
         is_multi = reason_str.apply(lambda s: isinstance(s, str) and "," in s)
-        is_excluded = df[target_column] != self.included_value
+        is_multi = is_multi & ~is_uncertain  # never drop uncertain rows for reason
+        is_excluded = (df[target_column] != self.included_value) & ~is_uncertain
         is_missing_reason = is_excluded & reason_str.astype(str).str.strip().eq("")
 
         n_invalid_target = int(is_invalid_target.sum())
@@ -150,6 +162,8 @@ class StratifiedKFoldByDecisionAndReason(SplitStrategy):
         reason_clean = df_f[self.reason_column].fillna("").astype(str).str.strip()
         key = reason_clean.copy()
         key[df_f[target_column] == self.included_value] = self.INCLUDED_KEY
+        if self.uncertain_value is not None:
+            key[df_f[target_column] == self.uncertain_value] = self.UNCLEAR_KEY
 
         counts = key.value_counts()
         rare_strata = counts[counts < self.n_splits].index
@@ -287,6 +301,7 @@ class StratifiedSplitByDecisionAndReason(SplitStrategy):
     """
 
     INCLUDED_KEY = "__INCLUDED__"
+    UNCLEAR_KEY = "__UNCLEAR__"
     RARE_KEY = "__RARE__"
 
     def __init__(
@@ -296,6 +311,7 @@ class StratifiedSplitByDecisionAndReason(SplitStrategy):
         random_state: int = 42,
         reason_column: str = "If so; reason to reject?",
         included_value=1,
+        uncertain_value=None,
         invalid_target_values=("?", "-1"),
         min_per_stratum: int = 5,
         verbose: bool = True,
@@ -309,6 +325,9 @@ class StratifiedSplitByDecisionAndReason(SplitStrategy):
         self.random_state = random_state
         self.reason_column = reason_column
         self.included_value = included_value
+        # See StratifiedKFoldByDecisionAndReason: when set, this class is kept
+        # regardless of reason and stratified as a single __UNCLEAR__ stratum.
+        self.uncertain_value = uncertain_value
         self.invalid_target_values = set(str(v) for v in invalid_target_values)
         self.min_per_stratum = min_per_stratum
         self.verbose = verbose
@@ -329,8 +348,14 @@ class StratifiedSplitByDecisionAndReason(SplitStrategy):
             {"", *self.invalid_target_values}
         )
 
+        if self.uncertain_value is not None:
+            is_uncertain = df[target_column] == self.uncertain_value
+        else:
+            is_uncertain = pd.Series(False, index=df.index)
+
         is_multi = reason_str.apply(lambda s: isinstance(s, str) and "," in s)
-        is_excluded = df[target_column] != self.included_value
+        is_multi = is_multi & ~is_uncertain  # never drop uncertain rows for reason
+        is_excluded = (df[target_column] != self.included_value) & ~is_uncertain
         is_missing_reason = is_excluded & reason_str.astype(str).str.strip().eq("")
 
         n_invalid_target = int(is_invalid_target.sum())
@@ -343,6 +368,8 @@ class StratifiedSplitByDecisionAndReason(SplitStrategy):
         reason_clean = df_f[self.reason_column].fillna("").astype(str).str.strip()
         key = reason_clean.copy()
         key[df_f[target_column] == self.included_value] = self.INCLUDED_KEY
+        if self.uncertain_value is not None:
+            key[df_f[target_column] == self.uncertain_value] = self.UNCLEAR_KEY
 
         counts = key.value_counts()
         rare_strata = counts[counts < self.min_per_stratum].index

@@ -3,13 +3,16 @@ import torch
 import torch.nn.functional as F
 from transformers import LogitsProcessor
 
-
 # Reason code token IDs (BioMistral tokenizer)
 REASON_TOKEN_IDS = {
-    'Rn': 28711, 'R0': 28734, 'R1': 28740,
-    'R2': 28750, 'R3': 28770, 'R4': 28781,
+    "Rn": 28711,
+    "R0": 28734,
+    "R1": 28740,
+    "R2": 28750,
+    "R3": 28770,
+    "R4": 28781,
 }
-REASON_ORDER = ['Rn', 'R0', 'R1', 'R2', 'R3', 'R4']
+REASON_ORDER = ["Rn", "R0", "R1", "R2", "R3", "R4"]
 REASON_IDS_ORDERED = [REASON_TOKEN_IDS[k] for k in REASON_ORDER]
 
 # Decision token IDs (BioMistral tokenizer)
@@ -20,9 +23,14 @@ NO_ID = 708
 # If training uses class weights w_c, the weighted CE optimum predicts
 # P̂(c) ∝ w_c · P(c). Subtracting log(w_c) from each class logit before
 # argmax restores P̂(c) ∝ P(c). Keep in sync with EXCL_WEIGHTS in qlora.py.
-# sqrt(506/n_c) over post-cleanup train counts: R0=73, R1=141, R2=212, R3=116, R4=506.
+# sqrt(657/n_c) over the tuning/train decided-exclude counts:
+# R0=533, R1=293, R2=105, R3=164, R4=657 (R4 majority = 1.0).
 REASON_TRAIN_WEIGHTS = {
-    'R0': 2.63, 'R1': 1.89, 'R2': 1.54, 'R3': 2.09, 'R4': 1.0,
+    "R0": 1.11,
+    "R1": 1.5,
+    "R2": 2.5,
+    "R3": 2.0,
+    "R4": 1.0,
 }
 REASON_LOGIT_BIAS = {
     REASON_TOKEN_IDS[k]: -math.log(w) for k, w in REASON_TRAIN_WEIGHTS.items()

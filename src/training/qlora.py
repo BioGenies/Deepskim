@@ -24,6 +24,7 @@ from sklearn.metrics import (
     recall_score,
     f1_score,
     average_precision_score,
+    roc_auc_score,
     confusion_matrix,
     precision_recall_fscore_support,
 )
@@ -221,6 +222,12 @@ class QLora:
         label_smoothing: float = 0.03,
         reason_weights: Union[Dict[str, float], None] = None,
         continue_from: Union[str, None] = None,
+        lambda_suff: float = 0.0,
+        suff_pos_weight: Union[float, None] = None,
+        suff_dropout: float = 0.0,
+        suff_pooling: str = "mean",
+        suff_detach: bool = False,
+        suff_hidden_dim: Union[int, None] = None,
     ):
         self.model = model
         self.device = device
@@ -237,6 +244,12 @@ class QLora:
             positive_ratio=positive_ratio,
             label_smoothing=label_smoothing,
             reason_weights=reason_weights,
+            lambda_suff=lambda_suff,
+            suff_pos_weight=suff_pos_weight,
+            suff_dropout=suff_dropout,
+            suff_pooling=suff_pooling,
+            suff_detach=suff_detach,
+            suff_hidden_dim=suff_hidden_dim,
         )
         self.continue_from = continue_from
 
@@ -245,6 +258,61 @@ class QLora:
         if self.continue_from is not None:
             print(f"Resuming training from checkpoint: {self.continue_from}")
         self.trainer.train(self.continue_from)
+
+
+def pool_prompt_hidden(h, prompt_mask, mode="mean"):
+    """Pool per-token hidden states over the PROMPT tokens only.
+
+    Args:
+        h: [B, T, H] hidden states (un-shifted).
+        prompt_mask: [B, T] bool, True on prompt (non-pad, non-completion) tokens.
+        mode: "mean" (masked mean over prompt tokens, the legacy behaviour) or
+              "last" (the final prompt token — the position whose next-token
+              prediction IS the yes/no decision, so it carries the decision-shaped
+              summary; padding-side agnostic via a max-index gather).
+    Returns:
+        [B, H] pooled features.
+    """
+    if mode == "last":
+        pos = torch.arange(h.shape[1], device=h.device).unsqueeze(0).expand_as(prompt_mask)
+        masked = torch.where(prompt_mask, pos, torch.full_like(pos, -1))
+        idx = masked.max(dim=1).values.clamp(min=0)  # [B]
+        return h[torch.arange(h.shape[0], device=h.device), idx]
+    pm = prompt_mask.unsqueeze(-1).to(h.dtype)
+    return (h * pm).sum(1) / pm.sum(1).clamp(min=1.0)
+
+
+class SufficiencyHead(nn.Module):
+    """Probe on the pooled prompt hidden states -> logit P(insufficient).
+
+    Input dropout regularises the (hidden_size)-dim pooled features. The head
+    overfits fast at the ~4-5% `unclear` prevalence (only ~90 train positives) —
+    the first no-dropout run peaked ~step 300 then collapsed — so dropout is the
+    primary defence and a bare linear map is the default. `hidden_dim=None` gives
+    the original `nn.Linear` with state_dict keys `linear.{weight,bias}` (what the
+    serving/eval path reloads). Setting `hidden_dim` swaps in a small bottleneck
+    MLP (keys `net.*`) — more capacity, higher overfit risk; use only as an
+    ablation, not the default. Pooling is chosen upstream (see pool_prompt_hidden).
+    """
+
+    def __init__(self, hidden_size: int, dropout: float = 0.0, hidden_dim=None):
+        super().__init__()
+        self.dropout = nn.Dropout(float(dropout))
+        if hidden_dim:
+            self.linear = None
+            self.net = nn.Sequential(
+                nn.Linear(hidden_size, int(hidden_dim)),
+                nn.GELU(),
+                nn.Dropout(float(dropout)),
+                nn.Linear(int(hidden_dim), 1),
+            )
+        else:
+            self.linear = nn.Linear(hidden_size, 1)
+            self.net = None
+
+    def forward(self, x):
+        x = self.dropout(x)
+        return self.net(x) if self.net is not None else self.linear(x)
 
 
 class ReasonCodeSFTTrainer(SFTTrainer):
@@ -272,6 +340,12 @@ class ReasonCodeSFTTrainer(SFTTrainer):
         positive_ratio=0.3,
         label_smoothing=0.03,
         reason_weights: Union[Dict[str, float], None] = None,
+        lambda_suff: float = 0.0,
+        suff_pos_weight: Union[float, None] = None,
+        suff_dropout: float = 0.0,
+        suff_pooling: str = "mean",
+        suff_detach: bool = False,
+        suff_hidden_dim: Union[int, None] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -289,10 +363,77 @@ class ReasonCodeSFTTrainer(SFTTrainer):
         self._train_reason_true = []
         self._train_reason_pred = []
         self._train_reason_gold = []  # full gold reason per example, incl. Rn
+        self._train_suff_scores = []  # dropout-free head scores for train AUC/AP
+        self._train_suff_labels = []
         # --- timing probe: instruments the first N micro-batches only ---
         self._probe_max_steps = 30
         self._probe_step = 0
         self._probe_fwd_ms = 0.0
+
+        # --- sufficiency head (Option B): linear head on the mean-pooled prompt
+        # hidden states, trained with weighted BCE on the per-example
+        # `sufficiency` label. lambda_suff <= 0 disables the HEAD (legacy
+        # decision+reason model), but `unclear` rows are still masked from the
+        # decision/reason loss regardless — see the collator wrap below. ---
+        self.lambda_suff = float(lambda_suff or 0.0)
+        self.suff_pos_weight = suff_pos_weight
+        self.suff_dropout = float(suff_dropout or 0.0)
+        # `last` pooling reads the final prompt token (the decision-generation
+        # state); `detach` stops the sufficiency loss from back-propagating into
+        # the shared backbone, so it becomes a pure readout that cannot perturb
+        # the decision (the decision objective already makes that token
+        # sufficiency-rich). hidden_dim swaps the linear head for a bottleneck MLP.
+        self.suff_pooling = str(suff_pooling or "mean")
+        self.suff_detach = bool(suff_detach)
+        self.suff_hidden_dim = suff_hidden_dim
+        self.suff_head = None
+        if self.lambda_suff > 0.0:
+            hidden = self.model.config.hidden_size
+            dev = next(self.model.parameters()).device
+            head = SufficiencyHead(
+                hidden, dropout=self.suff_dropout, hidden_dim=self.suff_hidden_dim
+            ).to(device=dev, dtype=torch.float32)
+            for p in head.parameters():
+                p.requires_grad_(True)
+            # register as a submodule of the (PEFT) model so it is both moved
+            # with the model, toggled by model.train()/eval() (so dropout is
+            # active in training and off at eval), and picked up by the Trainer
+            # optimizer.
+            self.model.suff_head = head
+            self.suff_head = head
+            logging.info(
+                f"Sufficiency head attached (hidden={hidden}, lambda_suff="
+                f"{self.lambda_suff}, dropout={self.suff_dropout}, "
+                f"pos_weight={self.suff_pos_weight}, pooling={self.suff_pooling}, "
+                f"detach={self.suff_detach}, hidden_dim={self.suff_hidden_dim})"
+            )
+
+        # Wrap the data collator UNCONDITIONALLY to surface the scalar
+        # `sufficiency` label. It drives the decision/reason masking of `unclear`
+        # rows in compute_loss, which must happen whether or not the head is
+        # attached — otherwise the lambda=0 baseline would train on the unclear
+        # placeholder completions and stop being a clean ablation. The base LM
+        # collator would drop this extra scalar field.
+        base_collator = self.data_collator
+
+        def _suff_collator(features, _base=base_collator):
+            suff = None
+            if features and "sufficiency" in features[0]:
+                suff = [int(f.pop("sufficiency")) for f in features]
+            batch = _base(features)
+            if suff is not None:
+                batch["sufficiency"] = torch.tensor(suff, dtype=torch.float)
+            return batch
+
+        self.data_collator = _suff_collator
+
+    def _save(self, output_dir=None, state_dict=None):
+        # Persist the sufficiency head next to the PEFT adapter (PeftModel
+        # save_pretrained does not capture the extra head).
+        super()._save(output_dir, state_dict)
+        if self.suff_head is not None:
+            out = output_dir if output_dir is not None else self.args.output_dir
+            torch.save(self.suff_head.state_dict(), os.path.join(out, "suff_head.pt"))
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         if not torch.cuda.is_available() or self._probe_step >= self._probe_max_steps:
@@ -391,16 +532,19 @@ class ReasonCodeSFTTrainer(SFTTrainer):
         self, model, inputs, return_outputs=False, num_items_in_batch=None
     ):
         labels = inputs.get("labels")
+        # `sufficiency` is not a model input — pop it before the forward pass.
+        suff_labels = inputs.pop("sufficiency", None)
+        ohs = self.suff_head is not None  # need hidden states for the suff head
         if torch.cuda.is_available() and self._probe_step < self._probe_max_steps:
             _s = torch.cuda.Event(enable_timing=True)
             _e = torch.cuda.Event(enable_timing=True)
             _s.record()
-            outputs = model(**inputs)
+            outputs = model(**inputs, output_hidden_states=ohs)
             _e.record()
             torch.cuda.synchronize()
             self._probe_fwd_ms = _s.elapsed_time(_e)
         else:
-            outputs = model(**inputs)
+            outputs = model(**inputs, output_hidden_states=ohs)
         logits = outputs.get("logits")
 
         # Standard causal LM shift
@@ -425,18 +569,29 @@ class ReasonCodeSFTTrainer(SFTTrainer):
         reason_logits = logits_2d[:, -1, :]  # [B, V]
         reason_labels = labels_2d[:, -1]  # [B]
 
-        # ---- Part 1: Decision loss (yes/no, weighted) ----
+        # `unclear` rows (sufficiency==1) carry only a placeholder leaning
+        # completion — supervise the sufficiency head on them but mask their
+        # decision/reason loss so a guessed direction never trains those heads.
+        if suff_labels is not None:
+            decided = suff_labels.to(decision_labels.device) == 0
+        else:
+            decided = torch.ones_like(decision_labels, dtype=torch.bool)
+
+        # ---- Part 1: Decision loss (yes/no, weighted; decided rows only) ----
         weights_decision = torch.ones(V, device=model.device)
         weights_decision[YES_ID] = self.POSITIVE_WEIGHT
-        loss_decision = F.cross_entropy(
-            decision_logits,
-            decision_labels,
-            weight=weights_decision,
-            label_smoothing=self.label_smoothing,
-        )
+        if decided.any():
+            loss_decision = F.cross_entropy(
+                decision_logits[decided],
+                decision_labels[decided],
+                weight=weights_decision,
+                label_smoothing=self.label_smoothing,
+            )
+        else:
+            loss_decision = torch.tensor(0.0, device=model.device)
 
-        # ---- Part 2: Conditional 6-class reason loss (excluded examples only) ----
-        excl_mask = decision_labels == NO_ID
+        # ---- Part 2: Conditional 6-class reason loss (excluded, decided only) ----
+        excl_mask = (decision_labels == NO_ID) & decided
         loss_reason = torch.tensor(0.0, device=model.device)
         if excl_mask.any():
             excl_ids = torch.tensor(self.EXCL_REASON_IDS, device=model.device)
@@ -464,10 +619,50 @@ class ReasonCodeSFTTrainer(SFTTrainer):
         else:
             loss_struct = torch.tensor(0.0, device=model.device)
 
+        # ---- Part 4: Sufficiency head — weighted BCE on the pooled PROMPT hidden
+        # states (pooling over prompt tokens only avoids leaking the completion).
+        # `last` pooling reads the decision-generation token; `detach` makes the
+        # head a pure readout that never perturbs the shared backbone. ----
+        loss_suff = torch.tensor(0.0, device=model.device)
+        if suff_labels is not None and self.suff_head is not None:
+            h = outputs.hidden_states[-1]  # [B, T, H], un-shifted
+            am = inputs["attention_mask"]
+            full_labels = inputs["labels"]
+            prompt_mask = (full_labels == -100) & (am == 1)  # [B, T] bool
+            pooled = pool_prompt_hidden(h, prompt_mask, mode=self.suff_pooling)
+            if self.suff_detach:
+                pooled = pooled.detach()
+            suff_logit = self.suff_head(pooled.float()).squeeze(-1)  # [B]
+            pw = (
+                torch.tensor([self.suff_pos_weight], device=suff_logit.device)
+                if self.suff_pos_weight
+                else None
+            )
+            loss_suff = F.binary_cross_entropy_with_logits(
+                suff_logit, suff_labels.float().to(suff_logit.device), pos_weight=pw
+            )
+            # Accumulate train sufficiency scores/labels for train AUC/AP (logged in
+            # log()). Recompute the logit with the head in eval mode so dropout is
+            # off — makes the train metric comparable to the dev metric (dropout-free)
+            # and a clean read of the train fit vs the 0.88 linear-probe dev ceiling.
+            with torch.no_grad():
+                was_training = self.suff_head.training
+                self.suff_head.eval()
+                clean_logit = self.suff_head(pooled.detach().float()).squeeze(-1)
+                if was_training:
+                    self.suff_head.train()
+                self._train_suff_scores.append(
+                    torch.sigmoid(clean_logit).cpu().numpy()
+                )
+                self._train_suff_labels.append(
+                    suff_labels.detach().cpu().numpy().astype(int)
+                )
+
         loss = (
             self.LAMBDA_LOSSES[0] * loss_decision
             + self.LAMBDA_LOSSES[1] * loss_reason
             + self.LAMBDA_LOSSES[2] * loss_struct
+            + self.lambda_suff * loss_suff
         )
 
         sub = {
@@ -475,23 +670,27 @@ class ReasonCodeSFTTrainer(SFTTrainer):
             "loss_reason": loss_reason.detach().item(),
             "loss_struct": loss_struct.detach().item(),
         }
+        if self.suff_head is not None:
+            sub["loss_suff"] = loss_suff.detach().item()
         for k, v in sub.items():
             self._sub_loss_accum[k] = self._sub_loss_accum.get(k, 0.0) + v
         self._sub_loss_count += 1
 
-        # Accumulate training metrics from teacher-forced logits
+        # Accumulate training metrics from teacher-forced logits (decided rows
+        # only — `unclear` placeholders would otherwise pollute decision metrics).
         with torch.no_grad():
-            y_true = (decision_labels == YES_ID).cpu().numpy().astype(int)
+            dec = decided.cpu().numpy().astype(bool)
+            y_true = (decision_labels == YES_ID).cpu().numpy().astype(int)[dec]
             yes_no_logits = decision_logits[:, [NO_ID, YES_ID]]  # [B, 2]
-            y_pred = yes_no_logits.argmax(-1).cpu().numpy().astype(int)
-            p_yes = F.softmax(yes_no_logits.float(), dim=-1)[:, 1].cpu().numpy()
+            y_pred = yes_no_logits.argmax(-1).cpu().numpy().astype(int)[dec]
+            p_yes = F.softmax(yes_no_logits.float(), dim=-1)[:, 1].cpu().numpy()[dec]
             self._train_y_true.append(y_true)
             self._train_y_pred.append(y_pred)
             self._train_scores.append(p_yes)
-            self._train_reason_gold.append(reason_labels.cpu().numpy())
+            self._train_reason_gold.append(reason_labels.cpu().numpy()[dec])
             # Mirror eval: score reason only on excluded examples (positives
             # are untrained on Rn) and apply bias correction before argmax.
-            excl_mask_metric = decision_labels == NO_ID
+            excl_mask_metric = (decision_labels == NO_ID) & decided
             if excl_mask_metric.any():
                 corrected = apply_reason_logit_bias(reason_logits[excl_mask_metric])
                 self._train_reason_true.append(
@@ -518,6 +717,18 @@ class ReasonCodeSFTTrainer(SFTTrainer):
         all_metrics = None
         eval_loss_accum = {"decision": 0.0, "reason": 0.0}
         eval_loss_count = 0
+        suff_scores: list[float] = []
+        suff_labels_eval: list[int] = []
+        # `unclear` rows are undecidable — their placeholder completion must not
+        # pollute the decision/reason metrics; they feed the sufficiency AUC only.
+        # Aggregate compute_metrics on the last DECIDED row (not the last row).
+        try:
+            suff_flags = [int(s) for s in eval_ds["sufficiency"]]
+        except (KeyError, TypeError):
+            suff_flags = [0] * len(eval_ds)
+        last_decided_idx = max(
+            (i for i, s in enumerate(suff_flags) if s == 0), default=-1
+        )
 
         for idx, example in enumerate(tqdm(eval_ds, desc="AR eval")):
             prompt = example["prompt"]
@@ -530,6 +741,30 @@ class ReasonCodeSFTTrainer(SFTTrainer):
                 prompt_ids = prompt_ids[:, :-1]
             prompt_ids = prompt_ids.to(self.model.device)
             attention_mask = torch.ones_like(prompt_ids)
+
+            # Sufficiency head: p_insufficient from the pooled prompt hidden states
+            # (prompt-only input, so pooling matches training via pool_prompt_hidden:
+            # mean over all prompt tokens, or the final prompt token for `last`).
+            if self.suff_head is not None:
+                with torch.inference_mode(), autocast("cuda", dtype=torch.bfloat16):
+                    ho = self.model(
+                        input_ids=prompt_ids,
+                        attention_mask=attention_mask,
+                        output_hidden_states=True,
+                        use_cache=False,
+                    )
+                    pooled = pool_prompt_hidden(
+                        ho.hidden_states[-1], attention_mask.bool(), mode=self.suff_pooling
+                    )  # [1, H]
+                    p_insuff = torch.sigmoid(
+                        self.suff_head(pooled.float()).squeeze(-1)
+                    ).item()
+                suff_scores.append(float(p_insuff))
+                suff_labels_eval.append(int(example.get("sufficiency", 0)))
+
+            # Skip undecidable rows for the decision/reason metrics + AR loss.
+            if int(example.get("sufficiency", 0)) == 1:
+                continue
 
             with torch.inference_mode(), autocast("cuda", dtype=torch.bfloat16):
                 outputs = self.model.generate(
@@ -609,7 +844,7 @@ class ReasonCodeSFTTrainer(SFTTrainer):
             eval_loss_count += 1
 
             eval_obj = EvalObj(predictions=gen_logits.cpu(), label_ids=label_ids)
-            is_last = idx == len(eval_ds) - 1
+            is_last = idx == last_decided_idx
             ret = compute_metrics(eval_obj, compute_result=is_last, shift=False)
             if ret is not None:
                 all_metrics = ret
@@ -626,6 +861,15 @@ class ReasonCodeSFTTrainer(SFTTrainer):
             all_metrics["ar_loss_reason"] = eval_loss_accum["reason"] / eval_loss_count
             all_metrics["ar_loss_total"] = (
                 all_metrics["ar_loss_decision"] + all_metrics["ar_loss_reason"]
+            )
+
+        # Sufficiency-head metrics (needs both classes present in the eval set).
+        if self.suff_head is not None and len(set(suff_labels_eval)) > 1:
+            all_metrics["sufficiency_auc"] = float(
+                roc_auc_score(suff_labels_eval, suff_scores)
+            )
+            all_metrics["sufficiency_ap"] = float(
+                average_precision_score(suff_labels_eval, suff_scores)
             )
 
         prefixed = {f"{metric_key_prefix}_{k}": v for k, v in all_metrics.items()}
@@ -694,6 +938,20 @@ class ReasonCodeSFTTrainer(SFTTrainer):
                 self._train_reason_true = []
                 self._train_reason_pred = []
                 self._train_reason_gold = []
+
+            # Train sufficiency AUC/AP (dropout-free head scores). Independent of
+            # the decision block above — needs both classes in the logging window
+            # (unclear prevalence ~4.7%, so a few positives per window; guard).
+            if self._train_suff_labels:
+                suff_y = np.concatenate(self._train_suff_labels)
+                suff_s = np.concatenate(self._train_suff_scores)
+                if len(np.unique(suff_y)) > 1:
+                    logs["train_sufficiency_auc"] = float(roc_auc_score(suff_y, suff_s))
+                    logs["train_sufficiency_ap"] = float(
+                        average_precision_score(suff_y, suff_s)
+                    )
+                self._train_suff_scores = []
+                self._train_suff_labels = []
 
         if start_time is not None:
             super().log(logs, start_time=start_time)
