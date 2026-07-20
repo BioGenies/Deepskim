@@ -24,6 +24,7 @@ from sklearn.metrics import (
     recall_score,
     f1_score,
     average_precision_score,
+    roc_auc_score,
     confusion_matrix,
     precision_recall_fscore_support,
 )
@@ -35,6 +36,7 @@ from utils.evaluation import (
     REASON_IDS_ORDERED,
     YES_ID,
     NO_ID,
+    MAYBE_ID,
     gather_reason_logprobs,
     compute_inclusion_prob,
     percent_to_review_for_recall,
@@ -53,8 +55,11 @@ scores_list = []
 reason_true_list = []
 reason_pred_list = []
 reason_gold_all_list = []  # gold reason per example (incl. Rn for positives)
+maybe_score_list = []  # P(maybe) from the 3-way decision softmax (all rows)
+maybe_gold_list = []  # gold == maybe (uncertainty target, all rows)
 
-EXCL_REASON_KEYS = ["R0", "R1", "R2", "R3", "R4"]
+# R2 retired (Jul13): it was the absence-residual, not a content reason — 0 training rows.
+EXCL_REASON_KEYS = ["R0", "R1", "R3", "R4"]
 
 
 def _per_reason_classification_metrics(reason_true, reason_pred):
@@ -107,7 +112,7 @@ def compute_metrics(eval_preds, compute_result, shift=True):
     Each call accumulates one eval example. When compute_result=True,
     aggregates everything and returns the final metrics dict.
     """
-    global y_true_list, y_pred_list, scores_list, reason_true_list, reason_pred_list, reason_gold_all_list
+    global y_true_list, y_pred_list, scores_list, reason_true_list, reason_pred_list, reason_gold_all_list, maybe_score_list, maybe_gold_list
 
     logits = eval_preds.predictions  # [B, seq_len, vocab]  (torch, CPU)
     labels = eval_preds.label_ids  # [B, seq_len]
@@ -124,7 +129,7 @@ def compute_metrics(eval_preds, compute_result, shift=True):
         logits = logits[:, :-1, :]
         labels = labels[:, 1:]
 
-    # First token: decision (yes/no), last token: reason digit
+    # First token: decision (yes/no/maybe), last token: reason digit
     pred_first = preds[:, 0]  # [B]
     label_first = labels[:, 0]  # [B]
     logits_first = logits[:, 0, :]  # [B, V]
@@ -134,24 +139,33 @@ def compute_metrics(eval_preds, compute_result, shift=True):
     pred_last = apply_reason_logit_bias(logits[:, -1, :]).argmax(-1)  # [B]
     label_last = labels[:, -1]  # [B]
 
-    # Binary decision from yes/no token
-    y_true = (label_first == YES_ID).numpy().astype(int)
-    y_pred = (pred_first == YES_ID).numpy().astype(int)
+    # --- Uncertainty: P(maybe) from the 3-way decision softmax vs gold==maybe,
+    # over ALL rows (this is the whole point of the third decision token) ---
+    three = logits_first[:, [YES_ID, NO_ID, MAYBE_ID]]  # [B, 3]
+    p_maybe = F.softmax(three.float(), dim=-1)[:, 2]  # [B]
+    maybe_score_list.append(p_maybe.numpy())
+    maybe_gold_list.append((label_first == MAYBE_ID).numpy().astype(int))
 
-    # Ranking: P(yes) from 2-class softmax
-    yes_no_logits = logits_first[:, [NO_ID, YES_ID]]  # [B, 2]
-    p_yes = F.softmax(yes_no_logits.float(), dim=-1)[:, 1]  # [B]
-
-    y_true_list.append(y_true)
-    y_pred_list.append(y_pred)
-    scores_list.append(p_yes.numpy())
-    reason_gold_all_list.append(label_last.numpy())  # full vector, before Rn mask
-    mask_rn = label_last != REASON_TOKEN_IDS["Rn"]
-    label_last_neg = label_last[mask_rn]
-    pred_last_neg = pred_last[mask_rn]
-    if pred_last_neg.numel() > 0:
-        reason_true_list.append(label_last_neg.numpy())
-        reason_pred_list.append(pred_last_neg.numpy())
+    # --- Decision (include/exclude) + reason metrics on DECIDED rows only, so the
+    # yes/no numbers stay directly comparable to the pre-maybe runs ---
+    decided = (label_first == YES_ID) | (label_first == NO_ID)
+    if decided.any():
+        lf, pf = label_first[decided], pred_first[decided]
+        y_true = (lf == YES_ID).numpy().astype(int)
+        y_pred = (pf == YES_ID).numpy().astype(int)
+        yes_no_logits = logits_first[decided][:, [NO_ID, YES_ID]]  # [n, 2]
+        p_yes = F.softmax(yes_no_logits.float(), dim=-1)[:, 1]  # [n]
+        y_true_list.append(y_true)
+        y_pred_list.append(y_pred)
+        scores_list.append(p_yes.numpy())
+        ll, pl = label_last[decided], pred_last[decided]
+        reason_gold_all_list.append(ll.numpy())  # full vector, before Rn mask
+        mask_rn = ll != REASON_TOKEN_IDS["Rn"]
+        label_last_neg = ll[mask_rn]
+        pred_last_neg = pl[mask_rn]
+        if pred_last_neg.numel() > 0:
+            reason_true_list.append(label_last_neg.numpy())
+            reason_pred_list.append(pred_last_neg.numpy())
 
     if compute_result:
         y_true_all = np.concatenate(y_true_list)
@@ -161,20 +175,24 @@ def compute_metrics(eval_preds, compute_result, shift=True):
         reason_pred_all = np.concatenate(reason_pred_list)
         reason_gold_all = np.concatenate(reason_gold_all_list)
 
+        # `labels=` is REQUIRED. Without it sklearn infers the class set from the union
+        # of y_true and y_pred, so a single stray prediction of a class with no gold rows
+        # (retired R2, or pred-only Rn on an excluded row) injects an F1=0 phantom class
+        # and silently deflates the macro average by 1/k. Score the four REAL exclude
+        # classes only. See [[reason-macro-f1-divide-by-six-artifact]].
+        excl_label_ids = [REASON_TOKEN_IDS[k] for k in EXCL_REASON_KEYS]
         reason_macro_f1 = f1_score(
-            reason_true_all, reason_pred_all, average="macro", zero_division=0
+            reason_true_all,
+            reason_pred_all,
+            labels=excl_label_ids,
+            average="macro",
+            zero_division=0,
         )
+        # Rn kept in the confusion matrix only to SEE pred-only Rn leakage on excludes.
         reason_cm = confusion_matrix(
             reason_true_all,
             reason_pred_all,
-            labels=[
-                REASON_TOKEN_IDS["R0"],
-                REASON_TOKEN_IDS["R1"],
-                REASON_TOKEN_IDS["R2"],
-                REASON_TOKEN_IDS["R3"],
-                REASON_TOKEN_IDS["R4"],
-                REASON_TOKEN_IDS["Rn"],
-            ],
+            labels=excl_label_ids + [REASON_TOKEN_IDS["Rn"]],
         )
         print(f"Reason macro-F1: {reason_macro_f1:.4f}")
         print(f"Reason confusion matrix:\n{reason_cm}")
@@ -198,12 +216,28 @@ def compute_metrics(eval_preds, compute_result, shift=True):
             _per_reason_classification_metrics(reason_true_all, reason_pred_all)
         )
 
+        # Uncertainty head-to-head number: how well P(maybe) ranks the gold
+        # 'maybe' (unclear) rows above the confident yes/no rows.
+        maybe_score_all = np.concatenate(maybe_score_list)
+        maybe_gold_all = np.concatenate(maybe_gold_list)
+        metrics["uncertainty_prevalence"] = float(maybe_gold_all.mean())
+        if maybe_gold_all.sum() > 0:
+            metrics["uncertainty_ap"] = float(
+                average_precision_score(maybe_gold_all, maybe_score_all)
+            )
+        if 0 < maybe_gold_all.sum() < len(maybe_gold_all):
+            metrics["uncertainty_auc"] = float(
+                roc_auc_score(maybe_gold_all, maybe_score_all)
+            )
+
         y_true_list = []
         y_pred_list = []
         scores_list = []
         reason_true_list = []
         reason_pred_list = []
         reason_gold_all_list = []
+        maybe_score_list = []
+        maybe_gold_list = []
         return metrics
 
 
@@ -220,6 +254,8 @@ class QLora:
         positive_ratio: float = 0.3,
         label_smoothing: float = 0.03,
         reason_weights: Union[Dict[str, float], None] = None,
+        maybe_weight: Union[float, None] = None,
+        maybe_ratio: Union[float, None] = None,
         continue_from: Union[str, None] = None,
     ):
         self.model = model
@@ -237,6 +273,8 @@ class QLora:
             positive_ratio=positive_ratio,
             label_smoothing=label_smoothing,
             reason_weights=reason_weights,
+            maybe_weight=maybe_weight,
+            maybe_ratio=maybe_ratio,
         )
         self.continue_from = continue_from
 
@@ -254,12 +292,17 @@ class ReasonCodeSFTTrainer(SFTTrainer):
     Format: "no R1", "yes Rn", etc.
     """
 
-    # sqrt of inverse-frequency over post-cleanup train counts
-    # (R0=73, R1=141, R2=212, R3=116, R4=506), R4 majority = 1.0.
-    EXCL_REASON_ORDER = ["R0", "R1", "R2", "R3", "R4"]
+    # sqrt(majority/n_c) over the CURRENT (v5) train exclude counts:
+    #   R0=546, R1=297, R3=170, R4=671 (majority).  R2 retired (0 rows).
+    # WAS [2.63, 1.89, 1.54, 2.09, 1.0] from a long-dead corpus (R0=73 ... R4=506) in
+    # which R0 was the RAREST class; in v5 R0 is the second most COMMON, so that vector
+    # up-weighted a common class 2.6x in the reason CE. Recompute when splits change,
+    # and keep in sync with REASON_TRAIN_WEIGHTS in evaluation.py (the inference de-bias).
+    EXCL_REASON_ORDER = ["R0", "R1", "R3", "R4"]
     EXCL_REASON_IDS = [REASON_TOKEN_IDS[k] for k in EXCL_REASON_ORDER]
-    EXCL_WEIGHTS = [2.63, 1.89, 1.54, 2.09, 1.0]  # R0, R1, R2, R3, R4
+    EXCL_WEIGHTS = [1.11, 1.50, 1.99, 1.0]  # R0, R1, R3, R4
     POSITIVE_WEIGHT = 5
+    MAYBE_WEIGHT = 5  # up-weight the rare 'maybe' decision token in the CE
     LAMBDA_LOSSES = [
         0.2,
         1.0,
@@ -272,12 +315,19 @@ class ReasonCodeSFTTrainer(SFTTrainer):
         positive_ratio=0.3,
         label_smoothing=0.03,
         reason_weights: Union[Dict[str, float], None] = None,
+        maybe_weight: Union[float, None] = None,
+        maybe_ratio: Union[float, None] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.positive_ratio = positive_ratio
         self.label_smoothing = label_smoothing
         self.reason_weights = reason_weights
+        # 'maybe' (uncertainty) decision token controls
+        self.maybe_weight = (
+            float(maybe_weight) if maybe_weight is not None else float(self.MAYBE_WEIGHT)
+        )
+        self.maybe_ratio = maybe_ratio  # target batch fraction; None -> natural rate
         self._sub_loss_accum = {}
         self._sub_loss_count = 0
         self._eval_sub_loss_accum = {}
@@ -289,6 +339,8 @@ class ReasonCodeSFTTrainer(SFTTrainer):
         self._train_reason_true = []
         self._train_reason_pred = []
         self._train_reason_gold = []  # full gold reason per example, incl. Rn
+        self._train_maybe_score = []  # P(maybe) on train micro-batches
+        self._train_maybe_gold = []  # gold == maybe on train micro-batches
         # --- timing probe: instruments the first N micro-batches only ---
         self._probe_max_steps = 30
         self._probe_step = 0
@@ -323,21 +375,36 @@ class ReasonCodeSFTTrainer(SFTTrainer):
     def get_train_dataloader(self):
         dataset = self.train_dataset
 
-        def _reason_of(ex):
+        def _category(ex):
+            """(class, reason) — class in {pos(include), maybe(unclear), neg(exclude)}."""
             comp = str(ex.get("completion", ""))
             if comp.startswith("yes"):
-                return None
+                return "pos", None
+            if comp.startswith("maybe"):
+                return "maybe", None
             parts = comp.split()
-            return parts[-1] if parts else None
+            return "neg", (parts[-1] if parts else None)
 
-        reasons = [_reason_of(ex) for ex in dataset]
-        is_positive = [r is None for r in reasons]
-        n_pos = sum(is_positive)
-        n_neg = len(is_positive) - n_pos
+        cats = [_category(ex) for ex in dataset]
+        N = len(cats)
+        n_pos = sum(1 for c0, _ in cats if c0 == "pos")
+        n_maybe = sum(1 for c0, _ in cats if c0 == "maybe")
+        n_neg = N - n_pos - n_maybe
         if n_pos == 0 or n_neg == 0:
             return super().get_train_dataloader()
+
         r = self.positive_ratio
-        w_pos = r / n_pos
+        # Target batch fraction for 'maybe'; default = natural rate (keep prevalence)
+        # unless explicitly up-sampled via maybe_ratio. Leave ≥5% for negatives.
+        r_maybe = (
+            float(self.maybe_ratio)
+            if self.maybe_ratio is not None
+            else (n_maybe / N if n_maybe else 0.0)
+        )
+        r_maybe = min(r_maybe, max(0.0, 1.0 - r - 0.05))
+        r_neg = max(0.0, 1.0 - r - r_maybe)
+        w_pos = r / n_pos if n_pos else 0.0
+        w_maybe = r_maybe / n_maybe if n_maybe else 0.0
 
         # Per-reason multipliers (default 1.0 → reproduces uniform per-example
         # negative weighting, i.e. natural class frequency within negatives).
@@ -347,22 +414,24 @@ class ReasonCodeSFTTrainer(SFTTrainer):
                 m[k] = float(v)
 
         n_by_reason: Dict[str, int] = {}
-        for rk in reasons:
-            if rk is None:
+        for c0, rk in cats:
+            if c0 != "neg" or rk is None:
                 continue
             n_by_reason[rk] = n_by_reason.get(rk, 0) + 1
 
-        # Z normalises so that Σ over negatives of (m_k * (1-r) / Z) = 1 - r.
+        # Z normalises so that Σ over negatives of (m_k * r_neg / Z) = r_neg.
         Z = sum(m.get(k, 1.0) * n for k, n in n_by_reason.items())
         if Z <= 0:
             return super().get_train_dataloader()
 
         weights = []
-        for is_pos, rk in zip(is_positive, reasons):
-            if is_pos:
+        for c0, rk in cats:
+            if c0 == "pos":
                 weights.append(w_pos)
+            elif c0 == "maybe":
+                weights.append(w_maybe)
             else:
-                weights.append(m.get(rk, 1.0) * (1.0 - r) / Z)
+                weights.append(m.get(rk, 1.0) * r_neg / Z)
 
         sampler = WeightedRandomSampler(
             weights, num_samples=len(weights), replacement=True
@@ -371,8 +440,8 @@ class ReasonCodeSFTTrainer(SFTTrainer):
         # Realised conditional share P(reason=k | negative) in a sampled batch.
         realised = {k: m.get(k, 1.0) * n / Z for k, n in n_by_reason.items()}
         logging.info(
-            f"WeightedRandomSampler: {n_pos} positives (Rn), {n_neg} negatives, "
-            f"target positive_ratio={r:.2f}, "
+            f"WeightedRandomSampler: {n_pos} positives (Rn), {n_maybe} maybe, "
+            f"{n_neg} negatives, target positive_ratio={r:.2f}, maybe_ratio={r_maybe:.2f}, "
             f"reason counts={n_by_reason}, "
             f"reason multipliers={m}, "
             f"realised P(reason|neg)={ {k: round(v, 3) for k, v in realised.items()} }"
@@ -425,9 +494,12 @@ class ReasonCodeSFTTrainer(SFTTrainer):
         reason_logits = logits_2d[:, -1, :]  # [B, V]
         reason_labels = labels_2d[:, -1]  # [B]
 
-        # ---- Part 1: Decision loss (yes/no, weighted) ----
+        # ---- Part 1: Decision loss (yes/no/maybe, weighted) ----
+        # Full-vocab CE, so the third gold class ('maybe') is handled directly;
+        # only its class weight is added.
         weights_decision = torch.ones(V, device=model.device)
         weights_decision[YES_ID] = self.POSITIVE_WEIGHT
+        weights_decision[MAYBE_ID] = self.maybe_weight
         loss_decision = F.cross_entropy(
             decision_logits,
             decision_labels,
@@ -481,14 +553,28 @@ class ReasonCodeSFTTrainer(SFTTrainer):
 
         # Accumulate training metrics from teacher-forced logits
         with torch.no_grad():
-            y_true = (decision_labels == YES_ID).cpu().numpy().astype(int)
-            yes_no_logits = decision_logits[:, [NO_ID, YES_ID]]  # [B, 2]
-            y_pred = yes_no_logits.argmax(-1).cpu().numpy().astype(int)
-            p_yes = F.softmax(yes_no_logits.float(), dim=-1)[:, 1].cpu().numpy()
-            self._train_y_true.append(y_true)
-            self._train_y_pred.append(y_pred)
-            self._train_scores.append(p_yes)
-            self._train_reason_gold.append(reason_labels.cpu().numpy())
+            # Uncertainty: P(maybe) vs gold==maybe over all rows in the micro-batch
+            three = decision_logits[:, [YES_ID, NO_ID, MAYBE_ID]]  # [B, 3]
+            self._train_maybe_score.append(
+                F.softmax(three.float(), dim=-1)[:, 2].cpu().numpy()
+            )
+            self._train_maybe_gold.append(
+                (decision_labels == MAYBE_ID).cpu().numpy().astype(int)
+            )
+            # Decision + reason metrics on decided (yes/no) rows only, so the
+            # include/exclude numbers stay comparable to the pre-maybe runs.
+            decided = (decision_labels == YES_ID) | (decision_labels == NO_ID)
+            if decided.any():
+                dlab = decision_labels[decided]
+                yes_no_logits = decision_logits[decided][:, [NO_ID, YES_ID]]  # [n, 2]
+                self._train_y_true.append((dlab == YES_ID).cpu().numpy().astype(int))
+                self._train_y_pred.append(
+                    yes_no_logits.argmax(-1).cpu().numpy().astype(int)
+                )
+                self._train_scores.append(
+                    F.softmax(yes_no_logits.float(), dim=-1)[:, 1].cpu().numpy()
+                )
+                self._train_reason_gold.append(reason_labels[decided].cpu().numpy())
             # Mirror eval: score reason only on excluded examples (positives
             # are untrained on Rn) and apply bias correction before argmax.
             excl_mask_metric = decision_labels == NO_ID
@@ -578,18 +664,19 @@ class ReasonCodeSFTTrainer(SFTTrainer):
             label_ids_dev = label_ids.to(gen_logits.device)
             V = gen_logits.shape[-1]
 
-            # Decision loss (first token = yes/no)
+            # Decision loss (first token = yes/no/maybe)
             first_logits = gen_logits[:, 0, :]  # [1, V]
             first_label = label_ids_dev[:, 0]  # [1]
             weights_decision = torch.ones(V, device=gen_logits.device)
             weights_decision[YES_ID] = self.POSITIVE_WEIGHT
+            weights_decision[MAYBE_ID] = self.maybe_weight
             eval_loss_decision = F.cross_entropy(
                 first_logits, first_label, weight=weights_decision
             )
 
-            # Conditional reason loss (excluded examples only)
+            # Conditional reason loss (excluded 'no' examples only — not yes/maybe)
             eval_loss_reason = torch.tensor(0.0, device=gen_logits.device)
-            if (first_label != YES_ID).all():
+            if (first_label == NO_ID).all():
                 last_logits = gen_logits[:, -1, :]  # [1, V]
                 last_label = label_ids_dev[:, -1]  # [1]
                 excl_ids = torch.tensor(self.EXCL_REASON_IDS, device=gen_logits.device)
@@ -694,6 +781,22 @@ class ReasonCodeSFTTrainer(SFTTrainer):
                 self._train_reason_true = []
                 self._train_reason_pred = []
                 self._train_reason_gold = []
+
+            # Train-side uncertainty (P(maybe)) — computed independently of the
+            # decided-row metrics so it logs every window; a window with no
+            # 'maybe' rows skips AP/AUC cleanly instead of logging a misleading
+            # 0.0 (at the real batch size both always populate).
+            if self._train_maybe_score:
+                ms = np.concatenate(self._train_maybe_score)
+                mg = np.concatenate(self._train_maybe_gold)
+                if mg.sum() > 0:
+                    logs["train_uncertainty_ap"] = float(
+                        average_precision_score(mg, ms)
+                    )
+                if 0 < mg.sum() < len(mg):
+                    logs["train_uncertainty_auc"] = float(roc_auc_score(mg, ms))
+                self._train_maybe_score = []
+                self._train_maybe_gold = []
 
         if start_time is not None:
             super().log(logs, start_time=start_time)

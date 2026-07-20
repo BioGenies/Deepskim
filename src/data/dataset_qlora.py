@@ -5,7 +5,7 @@ import logging
 from data.data_splitter import DataSplitter, TrainTestSplit
 from data.dataset_builder import TrainTestConverter, DataFrameConverter
 
-from .prompts.Jun9_prompt import get_prompt
+from .prompts.Jul13_codebook_prompt import get_prompt
 from .exclusion_map import exclusion_reason_map
 
 from datasets import Dataset, DatasetDict
@@ -40,14 +40,21 @@ def prepare_dataset(
 
     def _create_completion(label, reason_to_exclude):
         """Creates a decision + reason-code completion for the LLM.
-        Returns 'yes Rn' for included papers, 'no <code>' for excluded,
-        or None for rows to drop (no reason given, or reason not in the
-        kept content-based codebook — metadata filters and 'Other' are
-        excluded from training/eval upstream).
+        include -> 'yes Rn', exclude -> 'no <code>', unclear -> 'maybe Rn'.
+        The 'maybe' decision token models curator uncertainty (route to a 2nd
+        reviewer / full-text); its 'Rn' slot is a structural placeholder so the
+        completion stays a fixed 3 tokens (the reason loss ignores non-'no' rows).
+        Handles both the string labels (include/exclude/unclear) and the legacy
+        numeric 1/0 encoding. Returns None to drop a row (exclude with no reason
+        given, or a reason not in the kept content-based codebook).
         """
-        if label == 1:
+        lab = label.strip().lower() if isinstance(label, str) else label
+        if lab in (1, "1", "include", "yes"):
             return "yes Rn"
-        if type(reason_to_exclude) == str:
+        if lab in ("unclear", "uncertain", "insufficient", "maybe"):
+            return "maybe Rn"
+        # exclude: requires a codebook-mapped reason
+        if isinstance(reason_to_exclude, str):
             reasons = reason_to_exclude.split(",")
             reason = sorted(reasons)[0].strip()
             code = exclusion_reason_map.get(reason)

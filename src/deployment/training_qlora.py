@@ -180,6 +180,8 @@ def train_model(config):
         positive_ratio=config["data"].get("positive_ratio", 0.3),
         label_smoothing=config.get("label_smoothing", 0.03),
         reason_weights=config["data"].get("reason_weights", None),
+        maybe_weight=config["data"].get("maybe_weight", None),
+        maybe_ratio=config["data"].get("maybe_ratio", None),
         continue_from=config["model"]["continue_from"],
     )
 

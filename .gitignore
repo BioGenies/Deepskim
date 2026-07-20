@@ -1,3 +1,6 @@
+# Learning-curve sweep outputs (subsampled CSVs, manifests, results, plots)
+experiments_out/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -204,3 +207,9 @@ cython_debug/
 
 # Training logs
 bert_finetuned/
+
+# Dataset audit outputs
+audit_outputs/
+notebooks/
+configs/
+experiments/

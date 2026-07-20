@@ -4,25 +4,42 @@ import torch.nn.functional as F
 from transformers import LogitsProcessor
 
 
-# Reason code token IDs (BioMistral tokenizer)
+# Reason code token IDs (BioMistral tokenizer).
+# R2 is RETIRED (Jul13) — it meant "antibody tested but effect on amyloid not quantified",
+# i.e. an exclusion licensed by the ABSENCE of a readout, which is the same condition as
+# `maybe`. It has ZERO training rows (in v4 and v5) and is gone from the codebook.
+# Its id is kept ONLY so a stray legacy prediction still decodes to a readable name;
+# it must not appear in any ordering, weight vector, or metric. Codes are NOT renumbered
+# (R3/R4 keep their token ids) so prior checkpoints stay comparable.
 REASON_TOKEN_IDS = {
     'Rn': 28711, 'R0': 28734, 'R1': 28740,
-    'R2': 28750, 'R3': 28770, 'R4': 28781,
+    'R2': 28750,  # RETIRED — decode-only, never emitted or scored
+    'R3': 28770, 'R4': 28781,
 }
-REASON_ORDER = ['Rn', 'R0', 'R1', 'R2', 'R3', 'R4']
+REASON_ORDER = ['Rn', 'R0', 'R1', 'R3', 'R4']
 REASON_IDS_ORDERED = [REASON_TOKEN_IDS[k] for k in REASON_ORDER]
 
 # Decision token IDs (BioMistral tokenizer)
 YES_ID = 5081
 NO_ID = 708
+# Third decision token for the uncertainty/abstain class ("maybe" -> route to a
+# 2nd reviewer / full-text). Single token (▁maybe) like yes/no, so the completion
+# "maybe Rn" stays a fixed 3-token sequence [▁maybe, ▁R, n].
+MAYBE_ID = 4357
 
 # Logit bias correction — undoes weighted-CE distortion at inference.
 # If training uses class weights w_c, the weighted CE optimum predicts
 # P̂(c) ∝ w_c · P(c). Subtracting log(w_c) from each class logit before
 # argmax restores P̂(c) ∝ P(c). Keep in sync with EXCL_WEIGHTS in qlora.py.
-# sqrt(506/n_c) over post-cleanup train counts: R0=73, R1=141, R2=212, R3=116, R4=506.
+# sqrt(majority/n_c) over the CURRENT (v5) train exclude counts:
+#   R0=546, R1=297, R3=170, R4=671 (majority).  R2 is retired (0 rows).
+# WAS [2.63, 1.89, 1.54, 2.09, 1.0], derived from a long-dead corpus
+# (R0=73, R1=141, R2=212, R3=116, R4=506) in which R0 was the RAREST class. In v5 R0 is
+# the second most COMMON — so the old vector up-weighted a common class 2.6x in the CE
+# and mis-corrected it back at inference. Recompute these whenever the splits change.
+# MUST stay in sync with EXCL_WEIGHTS in qlora.py.
 REASON_TRAIN_WEIGHTS = {
-    'R0': 2.63, 'R1': 1.89, 'R2': 1.54, 'R3': 2.09, 'R4': 1.0,
+    'R0': 1.11, 'R1': 1.50, 'R3': 1.99, 'R4': 1.0,
 }
 REASON_LOGIT_BIAS = {
     REASON_TOKEN_IDS[k]: -math.log(w) for k, w in REASON_TRAIN_WEIGHTS.items()
