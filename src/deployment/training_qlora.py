@@ -182,6 +182,9 @@ def train_model(config):
         reason_weights=config["data"].get("reason_weights", None),
         maybe_weight=config["data"].get("maybe_weight", None),
         maybe_ratio=config["data"].get("maybe_ratio", None),
+        # Top-level (not under `data:`) — it is a LOSS weight, not a sampler/data knob.
+        # Omit to keep the default [0.2, 1.0, 0.01]; set to run the reason ablation.
+        lambda_losses=config.get("lambda_losses", None),
         continue_from=config["model"]["continue_from"],
     )
 
